@@ -1,7 +1,11 @@
+/**
+ * GET  /api/kiosk/jobs/[orderId]  — Poll job status (kiosk polling during printing)
+ * POST /api/kiosk/jobs/[orderId]  — Start or resume printing from kiosk touchscreen
+ */
 import { eq } from "drizzle-orm";
 import { db } from "@/db";
 import { orders } from "@/db/schema";
-import { findByOrderId, getKioskState, toPublic } from "@/lib/server/orders";
+import { findByOrderId, toPublic, getKioskState } from "@/lib/server/orders";
 
 export const dynamic = "force-dynamic";
 
@@ -14,26 +18,44 @@ export async function GET(_req: Request, ctx: { params: Promise<{ orderId: strin
 
 export async function POST(req: Request, ctx: { params: Promise<{ orderId: string }> }) {
   const { orderId } = await ctx.params;
-  const { action } = (await req.json().catch(() => ({}))) as { action?: string };
-  const o = await findByOrderId(orderId);
+  const { action } = (await req.json().catch(() => ({}))) as { action?: "start" | "resume" };
+
+  const [o] = await db.select().from(orders).where(eq(orders.orderId, orderId));
   if (!o) return Response.json({ error: "not_found" }, { status: 404 });
 
-  if (action === "start" || action === "resume") {
-    const state = await getKioskState();
-    if (state !== "ready") return Response.json({ error: state }, { status: 409 });
-    const okFrom = action === "start" ? ["pin_accepted"] : ["failed"];
-    if (!okFrom.includes(o.status)) return Response.json(toPublic(o, false));
-    const [u] = await db
+  const printerState = await getKioskState();
+  if (printerState !== "ready") {
+    return Response.json({ error: printerState }, { status: 409 });
+  }
+
+  // Handle Demo order (simulated printer)
+  if (o.isDemo) {
+    const now = new Date();
+    const [updated] = await db
       .update(orders)
       .set({
-        status: "printing",
-        printStartedAt: new Date(),
-        printBaseline: action === "start" ? 0 : o.pagesPrinted,
-        failureReason: null,
+        status:         "printing",
+        printStartedAt: now,
+        failureReason:  null,
+        updatedAt:      now,
       })
       .where(eq(orders.id, o.id))
       .returning();
-    return Response.json(toPublic(u, false));
+
+    return Response.json(toPublic(updated, false));
   }
-  return Response.json({ error: "unknown_action" }, { status: 400 });
+
+  // Real order flow: Customer tapped "Print" at kiosk
+  // Transition to "queued" so Raspberry Pi agent claims it
+  const [updated] = await db
+    .update(orders)
+    .set({
+      status:        "queued",
+      failureReason: null,
+      updatedAt:     new Date(),
+    })
+    .where(eq(orders.id, o.id))
+    .returning();
+
+  return Response.json(toPublic(updated, false));
 }

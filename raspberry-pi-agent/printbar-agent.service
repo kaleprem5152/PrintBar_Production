@@ -1,0 +1,18 @@
+[Unit]
+Description=PrintBar Hardware & CUPS Print Agent
+After=network-online.target cups.service
+Wants=network-online.target cups.service
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/printbar-agent
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/pi/printbar-agent/venv/bin/python agent.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

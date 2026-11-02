@@ -4,28 +4,36 @@ import { useEffect, useState } from "react";
 import { Icon } from "@/components/ui/Icon";
 import { rupees } from "@/lib/config";
 
-type Method = "upi" | "card" | "netbanking";
-type Phase = "idle" | "processing" | "verifying" | "failed";
+type Phase = "idle" | "creating" | "redirecting" | "verifying" | "failed";
 
-const BANKS = ["State Bank of India", "HDFC Bank", "ICICI Bank", "Axis Bank", "Kotak Mahindra Bank", "Punjab National Bank"];
-
+/**
+ * PaymentSheet — Cashfree payment integration.
+ *
+ * Flow:
+ * 1. User clicks "Pay" → POST /api/payments/create-order (server-side CF order)
+ * 2. Received sessionId is used to redirect to Cashfree hosted checkout
+ * 3. After checkout, Cashfree redirects to /track/:orderId?new=1
+ * 4. The webhook independently updates the order status
+ * 5. The track page polls /api/orders/:id for PIN and status
+ *
+ * The hosted checkout URL approach is used here because:
+ * - It works on all browsers without JS SDK compatibility issues
+ * - It is fully supported on mobile and kiosk browsers
+ * - The Cashfree JS SDK can be added later for embedded checkout if desired
+ *
+ * UI design preserved from original prototype — only the payment logic changed.
+ */
 export function PaymentSheet({
   order,
   onClose,
   onPaid,
 }: {
-  order: { orderId: string; token: string; amount: number };
+  order:   { orderId: string; token: string; amount: number };
   onClose: () => void;
-  onPaid: () => void;
+  onPaid:  () => void;
 }) {
-  const [method, setMethod] = useState<Method>("upi");
   const [phase, setPhase] = useState<Phase>("idle");
   const [error, setError] = useState("");
-  const [upi, setUpi] = useState("");
-  const [card, setCard] = useState({ number: "", exp: "", cvv: "", name: "" });
-  const [bank, setBank] = useState(BANKS[0]);
-  const [fail, setFail] = useState(false);
-  const [touched, setTouched] = useState(false);
 
   useEffect(() => {
     const prev = document.body.style.overflow;
@@ -35,209 +43,158 @@ export function PaymentSheet({
     };
   }, []);
 
-  const valid =
-    method === "upi"
-      ? /^[\w.\-]{2,}@[a-zA-Z]{2,}$/.test(upi.trim())
-      : method === "card"
-        ? card.number.replace(/\s/g, "").length >= 15 && /^\d{2}\/\d{2}$/.test(card.exp) && card.cvv.length >= 3 && card.name.trim().length > 1
-        : !!bank;
-
   async function pay() {
-    setTouched(true);
-    if (!valid) return;
     setError("");
-    setPhase("processing");
+    setPhase("creating");
+
     try {
-      const r = await fetch("/api/payments/prototype", {
-        method: "POST",
+      // Step 1: Create a Cashfree order server-side
+      const r = await fetch("/api/payments/create-order", {
+        method:  "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ orderId: order.orderId, token: order.token, method, simulate: fail ? "failure" : "success" }),
+        body:    JSON.stringify({ orderId: order.orderId, token: order.token }),
       });
-      const g = await r.json();
-      if (!r.ok) throw new Error(g.error || "Payment failed.");
-      setPhase("verifying");
-      const v = await fetch("/api/payments/verify", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ orderId: order.orderId, token: order.token, paymentId: g.paymentId, signature: g.signature }),
-      });
-      const j = await v.json();
-      if (!v.ok) throw new Error(j.error || "We couldn't verify this payment.");
-      onPaid();
+
+      const j = await r.json();
+
+      if (!r.ok) {
+        throw new Error(j.error ?? "Could not initiate payment. Please try again.");
+      }
+
+      const { sessionId, cfOrderId } = j as { sessionId: string; cfOrderId: string };
+
+      if (!sessionId) {
+        throw new Error("Payment session could not be created.");
+      }
+
+      // Step 2: Redirect to Cashfree hosted checkout
+      // This is the safest approach for kiosk + mobile compatibility.
+      // Cashfree will redirect back to APP_BASE_URL/track/:orderId?new=1 after payment.
+      setPhase("redirecting");
+
+      const env = process.env.NEXT_PUBLIC_CASHFREE_ENV ?? "sandbox";
+      const checkoutUrl =
+        env === "production"
+          ? `https://payments.cashfree.com/order/#${sessionId}`
+          : `https://payments-test.cashfree.com/order/#${sessionId}`;
+
+      // Small delay so the user sees the "Redirecting..." message
+      await new Promise((resolve) => setTimeout(resolve, 600));
+      window.location.href = checkoutUrl;
+
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Payment failed.");
+      setError(e instanceof Error ? e.message : "Payment failed. Please try again.");
       setPhase("failed");
     }
   }
 
-  const busy = phase === "processing" || phase === "verifying";
+  const busy = phase === "creating" || phase === "redirecting" || phase === "verifying";
 
   return (
-    <div className="fixed inset-0 z-[100] flex items-end justify-center bg-ink/55 backdrop-blur-sm md:items-center" role="dialog" aria-modal="true" aria-label="Payment">
+    <div
+      className="fixed inset-0 z-[100] flex items-end justify-center bg-ink/55 backdrop-blur-sm md:items-center"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Payment"
+    >
       <div className="flex max-h-[94svh] w-full max-w-lg animate-fade-up flex-col overflow-hidden rounded-t-[28px] bg-paper shadow-2xl md:rounded-[28px]">
+        {/* Header */}
         <div className="flex items-center justify-between border-b border-line px-5 py-4">
           <div>
-            <p className="text-[12px] font-semibold uppercase tracking-[0.12em] text-mute">Pay securely · {order.orderId}</p>
+            <p className="text-[12px] font-semibold uppercase tracking-[0.12em] text-mute">
+              Pay securely · {order.orderId}
+            </p>
             <p className="text-2xl font-semibold tracking-tight">{rupees(order.amount)}</p>
           </div>
-          <button type="button" onClick={onClose} disabled={busy} aria-label="Close payment" className="flex h-10 w-10 items-center justify-center rounded-full border border-line disabled:opacity-40">
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={busy}
+            aria-label="Close payment"
+            className="flex h-10 w-10 items-center justify-center rounded-full border border-line disabled:opacity-40"
+          >
             <Icon name="x" size={18} />
           </button>
         </div>
 
+        {/* Body */}
         {busy ? (
           <div className="flex flex-1 flex-col items-center justify-center gap-4 px-6 py-16 text-center">
             <span className="h-12 w-12 animate-spin-slow rounded-full border-[3px] border-ink/15 border-t-signal" />
-            <p className="text-lg font-semibold">{phase === "processing" ? "Processing payment…" : "Verifying your payment…"}</p>
+            <p className="text-lg font-semibold">
+              {phase === "creating"
+                ? "Setting up your payment…"
+                : phase === "redirecting"
+                  ? "Redirecting to secure checkout…"
+                  : "Verifying your payment…"}
+            </p>
             <p className="max-w-xs text-sm text-mute">
-              {phase === "processing" ? "Please don't close this window or press back." : "Confirming with PrintBar before generating your PIN."}
+              {phase === "redirecting"
+                ? "You will be taken to Cashfree's secure checkout page."
+                : "Please don't close this window."}
             </p>
           </div>
         ) : (
-          <div className="flex-1 overflow-y-auto px-5 py-5">
-            {phase === "failed" && (
+          <div className="flex-1 overflow-y-auto px-5 py-6">
+            {phase === "failed" && error && (
               <div className="mb-5 flex gap-3 rounded-2xl border border-bad/25 bg-red-50 p-4 text-sm" role="alert">
                 <Icon name="alert" size={20} className="mt-0.5 shrink-0 text-bad" />
                 <div>
                   <p className="font-semibold text-bad">Payment unsuccessful</p>
-                  <p className="mt-0.5 text-ink/70">{error} You can try again or use another method.</p>
+                  <p className="mt-0.5 text-ink/70">{error} You can try again.</p>
                 </div>
               </div>
             )}
 
-            <div role="tablist" aria-label="Payment method" className="grid grid-cols-3 gap-2 rounded-2xl bg-paper-2 p-1">
-              {(
-                [
-                  ["upi", "UPI"],
-                  ["card", "Cards"],
-                  ["netbanking", "Net banking"],
-                ] as [Method, string][]
-              ).map(([m, label]) => (
-                <button
-                  key={m}
-                  role="tab"
-                  aria-selected={method === m}
-                  type="button"
-                  onClick={() => setMethod(m)}
-                  className={`h-11 rounded-xl text-[14px] font-semibold transition ${method === m ? "bg-white shadow-sm" : "text-mute"}`}
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
-
-            <div className="mt-5 space-y-3">
-              {method === "upi" && (
-                <>
-                  <div className="grid grid-cols-3 gap-2 text-center text-[13px] font-medium">
-                    {["Google Pay", "PhonePe", "Paytm"].map((a) => (
-                      <button key={a} type="button" onClick={() => setUpi((u) => u || "name@upi")} className="rounded-xl border border-line bg-white py-3 hover:border-ink/40">
-                        {a}
-                      </button>
-                    ))}
-                  </div>
-                  <Field label="UPI ID" value={upi} onChange={setUpi} placeholder="yourname@bank" error={touched && !valid ? "Enter a valid UPI ID, e.g. name@okbank" : ""} />
-                </>
-              )}
-              {method === "card" && (
-                <>
-                  <Field
-                    label="Card number"
-                    value={card.number}
-                    onChange={(v) => setCard({ ...card, number: v.replace(/\D/g, "").slice(0, 16).replace(/(.{4})/g, "$1 ").trim() })}
-                    placeholder="1234 5678 9012 3456"
-                    inputMode="numeric"
-                  />
-                  <div className="grid grid-cols-2 gap-3">
-                    <Field
-                      label="Expiry"
-                      value={card.exp}
-                      onChange={(v) => {
-                        const d = v.replace(/\D/g, "").slice(0, 4);
-                        setCard({ ...card, exp: d.length > 2 ? `${d.slice(0, 2)}/${d.slice(2)}` : d });
-                      }}
-                      placeholder="MM/YY"
-                      inputMode="numeric"
-                    />
-                    <Field label="CVV" value={card.cvv} onChange={(v) => setCard({ ...card, cvv: v.replace(/\D/g, "").slice(0, 4) })} placeholder="•••" inputMode="numeric" />
-                  </div>
-                  <Field label="Name on card" value={card.name} onChange={(v) => setCard({ ...card, name: v })} placeholder="As printed on card" error={touched && !valid ? "Please complete all card details" : ""} />
-                </>
-              )}
-              {method === "netbanking" && (
-                <div role="radiogroup" aria-label="Bank" className="grid gap-2">
-                  {BANKS.map((b) => (
-                    <button
-                      key={b}
-                      type="button"
-                      role="radio"
-                      aria-checked={bank === b}
-                      onClick={() => setBank(b)}
-                      className={`flex h-12 items-center justify-between rounded-xl border px-4 text-left text-[14.5px] font-medium ${bank === b ? "border-ink bg-white" : "border-line bg-white/60"}`}
-                    >
-                      {b}
-                      <span className={`flex h-5 w-5 items-center justify-center rounded-full border ${bank === b ? "border-ink bg-ink text-white" : "border-line"}`}>
-                        {bank === b && <Icon name="check" size={12} strokeWidth={3} />}
-                      </span>
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
-
-            <div className="mt-6 rounded-2xl border border-dashed border-line bg-white/60 p-3.5 text-[12.5px] leading-relaxed text-mute">
-              <p>
-                <b className="text-ink">Prototype gateway.</b> No real money is charged. In production this step is replaced by Razorpay or Easebuzz checkout, and the PIN is issued only after the server verifies the payment signature.
+            {/* Payment summary */}
+            <div className="rounded-2xl border border-line bg-white p-5">
+              <p className="text-[13px] font-semibold uppercase tracking-wider text-mute">
+                Order summary
               </p>
-              <label className="mt-2 flex cursor-pointer items-center gap-2 text-ink/80">
-                <input type="checkbox" checked={fail} onChange={(e) => setFail(e.target.checked)} className="h-4 w-4 accent-ink" />
-                Simulate a failed payment
-              </label>
+              <div className="mt-3 flex items-end justify-between">
+                <span className="text-[15px] text-ink/80">Total payable</span>
+                <span className="text-3xl font-semibold tabular-nums tracking-tight">
+                  {rupees(order.amount)}
+                </span>
+              </div>
+            </div>
+
+            {/* Payment methods supported */}
+            <div className="mt-4 rounded-2xl border border-line bg-white/60 p-4">
+              <p className="text-[13px] font-semibold text-mute">Accepted payment methods</p>
+              <p className="mt-1 text-[14px] text-ink/80">
+                UPI · Debit &amp; credit cards · Net banking · Wallets
+              </p>
+            </div>
+
+            {/* Security note */}
+            <div className="mt-4 flex items-start gap-2.5 rounded-2xl bg-ok-soft p-4">
+              <Icon name="shield" size={18} className="mt-0.5 shrink-0 text-ok" />
+              <p className="text-[13px] leading-relaxed text-ink/80">
+                You will be redirected to <strong>Cashfree&apos;s</strong> secure checkout.
+                Your payment details are handled directly by Cashfree and never stored by PrintBar.
+              </p>
             </div>
           </div>
         )}
 
+        {/* Footer */}
         {!busy && (
           <div className="border-t border-line bg-paper px-5 pb-5 pt-4">
-            <button type="button" onClick={pay} className="flex h-14 w-full items-center justify-center gap-2 rounded-full bg-ink text-[16px] font-semibold text-paper transition hover:bg-ink-2 active:scale-[0.99]">
+            <button
+              type="button"
+              onClick={pay}
+              className="flex h-14 w-full items-center justify-center gap-2 rounded-full bg-ink text-[16px] font-semibold text-paper transition hover:bg-ink-2 active:scale-[0.99]"
+            >
               <Icon name="lock" size={17} />
               {phase === "failed" ? "Try again" : "Pay"} {rupees(order.amount)}
             </button>
-            <p className="mt-3 text-center text-[12px] text-mute">UPI · Debit &amp; credit cards · Net banking</p>
+            <p className="mt-3 text-center text-[12px] text-mute">
+              Powered by Cashfree Payments · SSL secured
+            </p>
           </div>
         )}
       </div>
     </div>
-  );
-}
-
-function Field({
-  label,
-  value,
-  onChange,
-  placeholder,
-  error,
-  inputMode,
-}: {
-  label: string;
-  value: string;
-  onChange: (v: string) => void;
-  placeholder?: string;
-  error?: string;
-  inputMode?: "numeric" | "text";
-}) {
-  return (
-    <label className="block">
-      <span className="mb-1.5 block text-[12.5px] font-semibold text-mute">{label}</span>
-      <input
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        placeholder={placeholder}
-        inputMode={inputMode}
-        aria-invalid={!!error}
-        className={`h-12 w-full rounded-xl border bg-white px-4 text-[15px] outline-none focus:ring-2 ${error ? "border-bad focus:ring-bad/20" : "border-line focus:border-ink focus:ring-ink/10"}`}
-      />
-      {error && <span className="mt-1 block text-[12.5px] text-bad">{error}</span>}
-    </label>
   );
 }

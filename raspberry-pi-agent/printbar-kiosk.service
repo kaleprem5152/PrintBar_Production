@@ -1,0 +1,30 @@
+[Unit]
+Description=PrintBar Touchscreen Chromium Kiosk
+After=graphical.target network-online.target
+Wants=graphical.target
+
+[Service]
+Type=simple
+User=pi
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/pi/.Xauthority
+ExecStartPre=/bin/sleep 5
+ExecStart=/usr/bin/chromium-browser \
+    --kiosk \
+    --noerrdialogs \
+    --disable-infobars \
+    --disable-translate \
+    --no-first-run \
+    --fast \
+    --fast-start \
+    --disable-features=Translate \
+    --touch-events=enabled \
+    --enable-features=OverlayScrollbar \
+    --overscroll-history-navigation=0 \
+    --check-for-update-interval=31536000 \
+    https://your-printbar-app.railway.app/kiosk
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=graphical.target

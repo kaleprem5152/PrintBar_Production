@@ -6,7 +6,7 @@ import JSZip from "jszip";
 
 // Uploaded documents live only in temporary storage and are removed after a
 // successful print (or when the customer removes them).
-const DIR = path.join(os.tmpdir(), "printbar-uploads");
+const DIR = process.env.TEMP_STORAGE_PATH || path.join(os.tmpdir(), "printbar-uploads");
 const UUID = /^[0-9a-f-]{36}$/i;
 
 export type FileMeta = { name: string; size: number; pages: number; estimated: boolean; kind: string };
@@ -15,6 +15,24 @@ export async function storeFile(id: string, ext: string, data: Buffer, meta: Fil
   await mkdir(DIR, { recursive: true });
   await writeFile(path.join(DIR, `${id}.${ext}`), data);
   await writeFile(path.join(DIR, `${id}.meta`), JSON.stringify(meta));
+}
+
+/** Retrieve the stored file buffer and metadata */
+export async function getStoredFile(id: string): Promise<{ buffer: Buffer; meta: FileMeta; ext: string } | null> {
+  if (!UUID.test(id)) return null;
+  const meta = await readMeta(id);
+  if (!meta) return null;
+
+  try {
+    const files = await readdir(DIR);
+    const filename = files.find((f) => f.startsWith(id + ".") && !f.endsWith(".meta"));
+    if (!filename) return null;
+    const buffer = await readFile(path.join(DIR, filename));
+    const ext = filename.split(".").pop()?.toLowerCase() ?? meta.kind;
+    return { buffer, meta, ext };
+  } catch {
+    return null;
+  }
 }
 
 /** Server-side record of an upload. Page counts used for billing always come from here. */

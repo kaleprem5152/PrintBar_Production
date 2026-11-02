@@ -1,0 +1,9 @@
+node_modules
+.next
+.git
+.env*.local
+.env
+raspberry-pi-agent/data
+raspberry-pi-agent/venv
+README.md
+docs
