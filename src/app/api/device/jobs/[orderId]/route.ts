@@ -7,7 +7,7 @@
 import "server-only";
 import { and, eq } from "drizzle-orm";
 import { db } from "@/db";
-import { devices, orders, printJobs } from "@/db/schema";
+import { devices, orders, devicePrintJobs } from "@/db/schema";
 import { authenticateDevice } from "@/lib/server/device-auth";
 import { logAuditEvent } from "@/lib/server/orders";
 import { cleanupOrderFiles } from "@/lib/server/files";
@@ -86,14 +86,14 @@ export async function POST(req: Request, ctx: Params) {
     }).where(eq(orders.orderId, orderId));
 
     // Update print job record
-    await db.update(printJobs).set({
+    await db.update(devicePrintJobs).set({
       completedAt:     now,
       pagesConfirmed:  pagesPrinted ?? order.pagesToPrint,
       cupsStatus:      "completed",
     }).where(
       and(
-        eq(printJobs.orderId, orderId),
-        eq(printJobs.deviceId, auth.deviceId!)
+        eq(devicePrintJobs.orderId, orderId),
+        eq(devicePrintJobs.deviceId, auth.deviceId!)
       )
     );
 
@@ -120,6 +120,26 @@ export async function POST(req: Request, ctx: Params) {
           paperReady,
           updatedAt:    new Date(),
         }).where(eq(devices.id, auth.deviceId!));
+
+        // Synchronize admin printers table
+        try {
+          const { printers: adminPrinters } = await import("@/db/schema");
+          const allPrns = await db.select().from(adminPrinters);
+          for (const prn of allPrns) {
+            const isCanon = prn.supportsColor || prn.id.toLowerCase().includes("canon") || prn.name.toLowerCase().includes("colour");
+            if ((printer === "canon_gx6170" && isCanon) || (printer !== "canon_gx6170" && !isCanon)) {
+              const remaining = Math.max(0, (prn.paperRemaining ?? 0) - sheetsConsumed);
+              await db.update(adminPrinters).set({
+                paperRemaining: remaining,
+                paperSource: "estimated",
+                totalPages: (prn.totalPages ?? 0) + (pagesPrinted ?? order.pagesToPrint),
+                lastSuccessfulPrintAt: new Date(),
+              }).where(eq(adminPrinters.id, prn.id));
+            }
+          }
+        } catch {
+          // non-blocking
+        }
       }
     } catch (paperErr) {
       console.warn("[jobs] Could not update device paper count:", (paperErr as Error).message);
@@ -169,15 +189,15 @@ export async function POST(req: Request, ctx: Params) {
       updatedAt:        new Date(),
     }).where(eq(orders.orderId, orderId));
 
-    await db.update(printJobs).set({
+    await db.update(devicePrintJobs).set({
       failedAt:       new Date(),
       failureReason:  reason ?? "unknown",
       cupsStatus:     "failed",
       pagesAttempted: actualPagesPrinted,
     }).where(
       and(
-        eq(printJobs.orderId, orderId),
-        eq(printJobs.deviceId, auth.deviceId!)
+        eq(devicePrintJobs.orderId, orderId),
+        eq(devicePrintJobs.deviceId, auth.deviceId!)
       )
     );
 

@@ -1,4 +1,8 @@
 import { PRICING, type ColorMode, type Sides } from "./config";
+import { DEFAULT_PRICING, type PricingConfig } from "./quote";
+
+export { calcQuote, DEFAULT_PRICING } from "./quote";
+export type { PricingConfig, QuoteInput } from "./quote";
 
 export type PagesPerSheet = 1 | 2 | 4 | 6;
 

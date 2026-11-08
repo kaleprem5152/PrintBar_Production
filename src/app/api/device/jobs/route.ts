@@ -6,7 +6,7 @@ import "server-only";
 import { and, eq, inArray, lte } from "drizzle-orm";
 import { randomBytes } from "crypto";
 import { db } from "@/db";
-import { orders, printJobs } from "@/db/schema";
+import { orders, devicePrintJobs } from "@/db/schema";
 import { authenticateDevice } from "@/lib/server/device-auth";
 import { logAuditEvent } from "@/lib/server/orders";
 
@@ -87,7 +87,7 @@ export async function POST(req: Request) {
 
   // Create a print job record
   const jobRef = `JOB-${randomBytes(6).toString("hex").toUpperCase()}`;
-  await db.insert(printJobs).values({
+  await db.insert(devicePrintJobs).values({
     orderId,
     jobRef,
     deviceId,

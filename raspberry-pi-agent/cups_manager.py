@@ -162,9 +162,10 @@ class CupsManager:
         if not cups_job_id:
             return result
 
-        # Check PyCUPS if installed
+        # Check PyCUPS if installed (dynamic import ensures compatibility across environments without IDE unresolved import errors)
         try:
-            import cups
+            import importlib
+            cups = importlib.import_module("cups")
             conn = cups.Connection()
             job_num = int(cups_job_id.split("-")[-1]) if "-" in cups_job_id else int(cups_job_id)
             attrs = conn.getJobAttributes(job_num)

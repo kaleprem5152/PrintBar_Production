@@ -1,79 +1,46 @@
-import "server-only";
-import { desc, eq } from "drizzle-orm";
+import { and, count, desc, eq, ilike, or } from "drizzle-orm";
 import { db } from "@/db";
-import { orders, refundTransactions } from "@/db/schema";
-import { getAuthenticatedAdmin } from "@/lib/server/admin-auth";
-import { executeOrderRefund, syncPendingRefunds } from "@/lib/server/refunds";
+import { printJobs, refunds } from "@/db/schema";
+import { ApiError, audit, int, oneOf, pageParams, route } from "@/lib/api";
+import { reconcileRefund } from "@/lib/refunds";
 
 export const dynamic = "force-dynamic";
 
-/**
- * GET /api/admin/refunds — List all refund transactions
- * POST /api/admin/refunds — Initiate a refund
- */
-export async function GET() {
-  const admin = await getAuthenticatedAdmin();
-  if (!admin) {
-    return Response.json({ error: "Unauthorized" }, { status: 401 });
+export const GET = route("payments.view", async ({ req }) => {
+  const sp = req.nextUrl.searchParams;
+  const { page, size, offset } = pageParams(sp);
+  const conds = [];
+  const status = sp.get("status");
+  if (status) conds.push(eq(refunds.status, status));
+  const q = sp.get("q")?.trim();
+  if (q) {
+    const like = `%${q.replace(/[%_]/g, "")}%`;
+    conds.push(or(ilike(refunds.refundRef, like), ilike(refunds.jobId, like), ilike(refunds.gatewayRefundId, like)));
   }
+  const where = conds.length ? and(...conds) : undefined;
+  const rows = await db
+    .select({ r: refunds, customerRef: printJobs.customerRef })
+    .from(refunds)
+    .innerJoin(printJobs, eq(printJobs.id, refunds.jobId))
+    .where(where)
+    .orderBy(desc(refunds.createdAt))
+    .limit(size)
+    .offset(offset);
+  const [{ total }] = await db.select({ total: count() }).from(refunds).where(where);
+  return { rows: rows.map((x) => ({ ...x.r, customerRef: x.customerRef })), total, page, size };
+});
 
-  try {
-    const refunds = await db
-      .select({
-        id: refundTransactions.id,
-        orderId: refundTransactions.orderId,
-        cashfreePaymentId: refundTransactions.cashfreePaymentId,
-        cashfreeRefundId: refundTransactions.cashfreeRefundId,
-        requestedAmount: refundTransactions.requestedAmount,
-        completedAmount: refundTransactions.completedAmount,
-        currency: refundTransactions.currency,
-        reason: refundTransactions.reason,
-        status: refundTransactions.status,
-        initiatedBy: refundTransactions.initiatedBy,
-        createdAt: refundTransactions.createdAt,
-        completedAt: refundTransactions.completedAt,
-        failureReason: refundTransactions.failureReason,
-        orderStatus: orders.status,
-        orderAmount: orders.amount,
-      })
-      .from(refundTransactions)
-      .leftJoin(orders, eq(refundTransactions.orderId, orders.orderId))
-      .orderBy(desc(refundTransactions.id))
-      .limit(100);
-
-    return Response.json({ refunds });
-  } catch (err) {
-    return Response.json({ error: (err as Error).message }, { status: 500 });
-  }
-}
-
-export async function POST(req: Request) {
-  const admin = await getAuthenticatedAdmin();
-  if (!admin) {
-    return Response.json({ error: "Unauthorized" }, { status: 401 });
-  }
-
-  const { orderId, amount, reason } = (await req.json().catch(() => ({}))) as {
-    orderId?: string;
-    amount?: number;
-    reason?: string;
+/** Reconcile a refund against Cashfree. This is the only manual path that can move a refund forward. */
+export const POST = route("refunds.manage", async ({ user, ip, body }) => {
+  const b = await body();
+  oneOf(b.action, "action", ["reconcile"] as const);
+  const id = int(b.id, "Refund id", { min: 1 });
+  const r = await reconcileRefund(id);
+  if (!r) throw new ApiError(404, "Refund not found");
+  await audit({ user, ip }, "refund.reconcile", "refund", r.refundRef, { status: r.status, gatewayStatus: r.gatewayStatus });
+  return {
+    ok: true,
+    refund: r,
+    message: r.status === "success" ? "Refund is complete (gateway-confirmed)." : r.status === "failed" ? "Gateway reports the refund failed." : `Still ${r.status} at the gateway.`,
   };
-
-  if (!orderId) {
-    return Response.json({ error: "orderId is required" }, { status: 400 });
-  }
-
-  try {
-    const outcome = await executeOrderRefund({
-      orderId,
-      amount,
-      reason: reason || "Manual admin refund issued",
-      initiatedBy: `admin:${admin}`,
-    });
-
-    return Response.json(outcome);
-  } catch (err) {
-    return Response.json({ error: (err as Error).message }, { status: 500 });
-  }
-}
-
+});

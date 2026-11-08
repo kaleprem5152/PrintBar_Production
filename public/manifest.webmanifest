@@ -1,0 +1,20 @@
+{
+  "name": "PrintBar Admin Control Centre",
+  "short_name": "PrintBar Admin",
+  "description": "Operate PrintBar self-service printing kiosks from your phone.",
+  "start_url": "/admin",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#0b1220",
+  "theme_color": "#0b1220",
+  "icons": [
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icon-512.png", "sizes": "192x192", "type": "image/png", "purpose": "any" }
+  ],
+  "shortcuts": [
+    { "name": "Critical alerts", "url": "/admin/notifications?tab=alerts" },
+    { "name": "Failed jobs", "url": "/admin/jobs?status=failed" },
+    { "name": "Printers", "url": "/admin/printers" }
+  ]
+}

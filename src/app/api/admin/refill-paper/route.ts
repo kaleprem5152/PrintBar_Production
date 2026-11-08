@@ -52,6 +52,23 @@ export async function POST(req: Request) {
       .where(eq(devices.id, deviceId))
       .returning();
 
+    // Also update printers table
+    try {
+      const { printers } = await import("@/db/schema");
+      const allPrinters = await db.select().from(printers);
+      for (const prn of allPrinters) {
+        const isCanon = prn.supportsColor || prn.id.toLowerCase().includes("canon") || prn.model.toLowerCase().includes("canon") || prn.name.toLowerCase().includes("colour") || prn.name.toLowerCase().includes("color");
+        if ((isCanon && (printer === "canon" || printer === "both")) || (!isCanon && (printer === "kyocera" || printer === "both"))) {
+          await db.update(printers).set({
+            paperRemaining: (prn.paperRemaining ?? 0) + amount,
+            paperSource: "manual",
+          }).where(eq(printers.id, prn.id));
+        }
+      }
+    } catch {
+      // non-blocking
+    }
+
     await logAuditEvent({
       eventType: "admin_action",
       deviceId,
@@ -77,3 +94,4 @@ export async function POST(req: Request) {
     return Response.json({ error: (err as Error).message }, { status: 500 });
   }
 }
+

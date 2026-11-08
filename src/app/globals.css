@@ -13,11 +13,30 @@
   --color-ok-soft: #e6f6ee;
   --color-warn: #d98a00;
   --color-bad: #d6342c;
+  --color-navy-950: #070c18;
+  --color-navy-900: #0b1220;
+  --color-navy-800: #111a2e;
+  --color-navy-700: #1a2540;
+  --color-navy-600: #26334f;
+  --color-brand-50: #eff6ff;
+  --color-brand-100: #dbeafe;
+  --color-brand-500: #3b82f6;
+  --color-brand-600: #2563eb;
+  --color-brand-700: #1d4ed8;
   --font-sans: "Geist Variable", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   --font-display: "Instrument Serif", "Times New Roman", serif;
   --animate-fade-up: fade-up 0.6s cubic-bezier(0.2, 0.7, 0.2, 1) both;
   --animate-pop: pop 0.5s cubic-bezier(0.2, 1.4, 0.4, 1) both;
+  --animate-fade-in: fade-in 0.18s ease-out;
+  --animate-sheet-up: sheet-up 0.24s cubic-bezier(0.16, 1, 0.3, 1);
+  --animate-slide-in: slide-in 0.24s cubic-bezier(0.16, 1, 0.3, 1);
+  --animate-toast: toast-in 0.22s cubic-bezier(0.16, 1, 0.3, 1);
 }
+
+@keyframes fade-in { from { opacity: 0 } to { opacity: 1 } }
+@keyframes sheet-up { from { transform: translateY(24px); opacity: 0 } to { transform: none; opacity: 1 } }
+@keyframes slide-in { from { transform: translateX(-16px); opacity: 0 } to { transform: none; opacity: 1 } }
+@keyframes toast-in { from { transform: translateY(-12px); opacity: 0 } to { transform: none; opacity: 1 } }
 
 @keyframes fade-up {
   from { opacity: 0; transform: translateY(14px); }
@@ -133,3 +152,11 @@ input[type="number"]::-webkit-inner-spin-button { -webkit-appearance: none; }
   }
   .animate-flow-label, .animate-flow-printed { opacity: 1; }
 }
+
+.pb-safe { padding-bottom: env(safe-area-inset-bottom); }
+.pt-safe { padding-top: env(safe-area-inset-top); }
+.tabular { font-variant-numeric: tabular-nums; }
+.scroll-thin { scrollbar-width: thin; scrollbar-color: #cbd5e1 transparent; }
+.no-scrollbar { scrollbar-width: none; }
+.no-scrollbar::-webkit-scrollbar { display: none; }
+.live-dot { animation: pulse-ring 1.8s ease-out infinite; }
