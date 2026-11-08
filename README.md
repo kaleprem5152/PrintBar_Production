@@ -270,3 +270,4 @@ Access the operations console at `https://your-domain.railway.app/admin`:
 
 ## 📄 License
 Commercial proprietary software developed for PrintBar self-service printing ATM kiosks.
+

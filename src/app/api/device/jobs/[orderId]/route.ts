@@ -7,10 +7,11 @@
 import "server-only";
 import { and, eq } from "drizzle-orm";
 import { db } from "@/db";
-import { orders, printJobs } from "@/db/schema";
+import { devices, orders, printJobs } from "@/db/schema";
 import { authenticateDevice } from "@/lib/server/device-auth";
 import { logAuditEvent } from "@/lib/server/orders";
-import { deleteStoredFiles } from "@/lib/server/files";
+import { cleanupOrderFiles } from "@/lib/server/files";
+import { calculateRefundAmount, executeOrderRefund } from "@/lib/server/refunds";
 
 export const dynamic = "force-dynamic";
 
@@ -71,17 +72,14 @@ export async function POST(req: Request, ctx: Params) {
       cupsJobId?:    string;
     };
 
-    // Delete stored files from cloud temp storage
-    const docs = order.docs as { id: string }[];
-    await deleteStoredFiles(docs.map((d) => d.id));
+    // Delete stored files from cloud temp storage with verified cleanup
+    await cleanupOrderFiles(orderId);
 
     const now = new Date();
     await db.update(orders).set({
       status:          "completed",
       pagesPrinted:    pagesPrinted ?? order.pagesToPrint,
       cupsJobId:       cupsJobId ?? order.cupsJobId,
-      filesDeleted:    true,
-      filesDeletedAt:  now,
       completedAt:     now,
       pin:             null,  // Clear PIN on completion
       updatedAt:       now,
@@ -99,6 +97,34 @@ export async function POST(req: Request, ctx: Params) {
       )
     );
 
+    // Deduct physical paper sheets from device inventory
+    try {
+      const printer = order.fallbackPrinter || order.printerUsed || (order.colorMode === "color" ? "canon_gx6170" : "kyocera_pa3500x");
+      const sheetsConsumed = order.physicalSheets || Math.max(1, Math.ceil((pagesPrinted ?? order.pagesToPrint) / (order.pagesPerSheet || 1)));
+
+      const [dev] = await db.select().from(devices).where(eq(devices.id, auth.deviceId!));
+      if (dev) {
+        let newKyocera = dev.kyoceraPaper ?? 0;
+        let newCanon = dev.canonPaper ?? 0;
+
+        if (printer === "canon_gx6170") {
+          newCanon = Math.max(0, newCanon - sheetsConsumed);
+        } else {
+          newKyocera = Math.max(0, newKyocera - sheetsConsumed);
+        }
+
+        const paperReady = newKyocera > 0 || newCanon > 0;
+        await db.update(devices).set({
+          kyoceraPaper: newKyocera,
+          canonPaper:   newCanon,
+          paperReady,
+          updatedAt:    new Date(),
+        }).where(eq(devices.id, auth.deviceId!));
+      }
+    } catch (paperErr) {
+      console.warn("[jobs] Could not update device paper count:", (paperErr as Error).message);
+    }
+
     await logAuditEvent({
       eventType: "print_completed",
       orderId,
@@ -109,7 +135,7 @@ export async function POST(req: Request, ctx: Params) {
       eventType: "document_deleted",
       orderId,
       deviceId:  auth.deviceId,
-      details:   { docCount: docs.length },
+      details:   { docCount: (order.docs as any[])?.length || 0 },
     });
 
     return Response.json({ ok: true, status: "completed" });
@@ -123,19 +149,31 @@ export async function POST(req: Request, ctx: Params) {
       cupsJobId?:    string;
     };
 
+    const actualPagesPrinted = pagesPrinted ?? order.pagesPrinted;
+    const refundCalc = calculateRefundAmount(order, actualPagesPrinted);
+
+    let refundStatus = order.refundStatus ?? "NOT_REQUIRED";
+    if (refundCalc.requiresReview) {
+      refundStatus = "REFUND_REQUIRES_REVIEW";
+    } else if (refundCalc.refundableAmount > 0) {
+      refundStatus = "REFUND_REQUESTED";
+    }
+
     await db.update(orders).set({
-      status:        "failed",
-      pagesPrinted:  pagesPrinted ?? order.pagesPrinted,
-      cupsJobId:     cupsJobId ?? order.cupsJobId,
-      failureReason: reason ?? "unknown",
-      updatedAt:     new Date(),
+      status:           "failed",
+      pagesPrinted:     actualPagesPrinted,
+      cupsJobId:        cupsJobId ?? order.cupsJobId,
+      failureReason:    reason ?? "unknown",
+      refundableAmount: refundCalc.refundableAmount,
+      refundStatus,
+      updatedAt:        new Date(),
     }).where(eq(orders.orderId, orderId));
 
     await db.update(printJobs).set({
-      failedAt:      new Date(),
-      failureReason: reason ?? "unknown",
-      cupsStatus:    "failed",
-      pagesAttempted: pagesPrinted ?? order.pagesPrinted,
+      failedAt:       new Date(),
+      failureReason:  reason ?? "unknown",
+      cupsStatus:     "failed",
+      pagesAttempted: actualPagesPrinted,
     }).where(
       and(
         eq(printJobs.orderId, orderId),
@@ -143,14 +181,29 @@ export async function POST(req: Request, ctx: Params) {
       )
     );
 
+    // If automatic refund is applicable and payment exists, trigger Cashfree refund
+    if (refundStatus === "REFUND_REQUESTED" && order.cashfreePaymentId) {
+      try {
+        await executeOrderRefund({
+          orderId,
+          amount: refundCalc.refundableAmount,
+          reason: refundCalc.reason,
+          scenario: "hardware_failure_partial_print",
+          initiatedBy: "system_printer_failure",
+        });
+      } catch (refundErr) {
+        console.error(`[jobs] Automatic refund trigger failed for ${orderId}:`, (refundErr as Error).message);
+      }
+    }
+
     await logAuditEvent({
       eventType: "print_failed",
       orderId,
       deviceId:  auth.deviceId,
-      details:   { reason, pagesPrinted, cupsJobId },
+      details:   { reason, pagesPrinted: actualPagesPrinted, cupsJobId, refundStatus, refundableAmount: refundCalc.refundableAmount },
     });
 
-    return Response.json({ ok: true, status: "failed" });
+    return Response.json({ ok: true, status: "failed", refundStatus, refundableAmount: refundCalc.refundableAmount });
   }
 
   // ── Fallback ──────────────────────────────────────────────────────────────

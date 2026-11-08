@@ -1,18 +1,13 @@
 /**
- * Cashfree Payments integration.
+ * Cashfree Payments & Refunds integration.
  *
  * Uses the Cashfree Payments API v2023-08-01 directly via HTTP.
- * No dependency on the Cashfree Node SDK (allows exact version control
- * and avoids SDK churn). All requests are server-side only.
+ * All requests are server-side only.
  *
- * Documentation: https://docs.cashfree.com/reference/pg-new-apis-endpoint
- *
- * Environment variables required:
- *   CASHFREE_CLIENT_ID
- *   CASHFREE_CLIENT_SECRET
- *   CASHFREE_ENV           = "sandbox" | "production"
- *   CASHFREE_API_VERSION   = "2023-08-01"
- *   APP_BASE_URL           = "https://your-app.railway.app"
+ * Documentation:
+ *   - Orders & Payments: https://docs.cashfree.com/reference/pg-new-apis-endpoint
+ *   - Refunds: https://docs.cashfree.com/reference/createrefund
+ *   - Webhook security: https://docs.cashfree.com/docs/webhook-security
  */
 import "server-only";
 import { createHmac, timingSafeEqual } from "crypto";
@@ -69,28 +64,17 @@ export type CashfreePaymentResult = {
   paymentTime:   string;
 };
 
-export type CashfreeWebhookPayload = {
-  data: {
-    order: {
-      order_id:     string;
-      order_amount: number;
-      order_currency: string;
-    };
-    payment: {
-      cf_payment_id: string;
-      payment_status: string;
-      payment_amount: number;
-      payment_currency: string;
-      payment_method: Record<string, unknown>;
-      payment_time: string;
-    };
-    customer_details?: {
-      customer_id?: string;
-      customer_phone?: string;
-    };
-  };
-  event_time: string;
-  type: string;
+export type CashfreeRefundResult = {
+  cfPaymentId?:      string;
+  cfRefundId:        string;
+  orderId:           string;
+  refundId:          string;
+  refundAmount:      number;
+  refundCurrency:    string;
+  refundStatus:      "SUCCESS" | "PENDING" | "FAILED";
+  refundNote:        string;
+  statusDescription?: string;
+  processedAt?:      string;
 };
 
 // ─── API client ────────────────────────────────────────────────────────────────
@@ -252,7 +236,7 @@ export async function verifyCashfreePayment(cfOrderId: string): Promise<{
     return {
       paid:          false,
       paymentId:     latestPayment?.cf_payment_id ?? "",
-      paymentStatus: latestPayment?.payment_status ?? "PENDING",
+      paymentStatus: (latestPayment?.payment_status as any) ?? "PENDING",
       amount:        latestPayment?.payment_amount ?? 0,
       paymentMethod: extractPaymentMethod(latestPayment?.payment_method ?? {}),
       paymentTime:   latestPayment?.payment_time ?? "",
@@ -266,6 +250,132 @@ export async function verifyCashfreePayment(cfOrderId: string): Promise<{
     amount:        successPayment.payment_amount,
     paymentMethod: extractPaymentMethod(successPayment.payment_method),
     paymentTime:   successPayment.payment_time,
+  };
+}
+
+/**
+ * Get full order details from Cashfree by order ID.
+ */
+export async function getCashfreeOrder(orderId: string): Promise<{
+  cfOrderId?: string;
+  orderId?: string;
+  orderAmount?: number;
+  orderStatus?: string;
+  createdAt?: string;
+}> {
+  const result = await cfRequest<{
+    cf_order_id?: string;
+    order_id?: string;
+    order_amount?: number;
+    order_status?: string;
+    created_at?: string;
+  }>(`/orders/${orderId}`, {
+    method: "GET",
+  });
+
+  if (!result.ok) {
+    throw new Error(result.error ?? `Order ${orderId} not found in Cashfree`);
+  }
+
+  return {
+    cfOrderId:   result.data.cf_order_id,
+    orderId:     result.data.order_id,
+    orderAmount: result.data.order_amount,
+    orderStatus: result.data.order_status,
+    createdAt:   result.data.created_at,
+  };
+}
+
+// ─── Cashfree Refund API ───────────────────────────────────────────────────────
+
+/**
+ * Initiates a refund for an order via Cashfree.
+ * Cashfree v2023-08-01: POST /orders/{order_id}/refunds
+ */
+export async function createCashfreeRefund(params: {
+  orderId:      string; // Internal order ID (e.g. PB-2026-00019)
+  refundAmount: number; // Rupees (e.g. 10)
+  refundId:     string; // Unique merchant refund reference (e.g. ref_PB-2026-00019_1)
+  refundNote:   string; // Reason for refund
+}): Promise<CashfreeRefundResult> {
+  const result = await cfRequest<{
+    cf_payment_id?:      string;
+    cf_refund_id?:       string;
+    order_id?:           string;
+    refund_id?:          string;
+    refund_amount?:      number;
+    refund_currency?:    string;
+    refund_status?:      "SUCCESS" | "PENDING" | "FAILED";
+    refund_note?:        string;
+    status_description?: string;
+    created_at?:         string;
+    message?:            string;
+  }>(`/orders/${params.orderId}/refunds`, {
+    method: "POST",
+    body: {
+      refund_amount: params.refundAmount,
+      refund_id:     params.refundId,
+      refund_note:   params.refundNote.slice(0, 100),
+      refund_speed:  "STANDARD",
+    },
+  });
+
+  if (!result.ok || !result.data.cf_refund_id) {
+    throw new Error(result.error ?? "Failed to initiate Cashfree refund");
+  }
+
+  return {
+    cfPaymentId:       result.data.cf_payment_id,
+    cfRefundId:        result.data.cf_refund_id,
+    orderId:           result.data.order_id ?? params.orderId,
+    refundId:          result.data.refund_id ?? params.refundId,
+    refundAmount:      result.data.refund_amount ?? params.refundAmount,
+    refundCurrency:    result.data.refund_currency ?? "INR",
+    refundStatus:      result.data.refund_status ?? "PENDING",
+    refundNote:        result.data.refund_note ?? params.refundNote,
+    statusDescription: result.data.status_description,
+    processedAt:       result.data.created_at,
+  };
+}
+
+/**
+ * Check the status of a specific refund on Cashfree.
+ * GET /orders/{order_id}/refunds/{refund_id}
+ */
+export async function getCashfreeRefundStatus(
+  orderId:  string,
+  refundId: string
+): Promise<CashfreeRefundResult> {
+  const result = await cfRequest<{
+    cf_payment_id?:      string;
+    cf_refund_id?:       string;
+    order_id?:           string;
+    refund_id?:          string;
+    refund_amount?:      number;
+    refund_currency?:    string;
+    refund_status?:      "SUCCESS" | "PENDING" | "FAILED";
+    refund_note?:        string;
+    status_description?: string;
+    created_at?:         string;
+  }>(`/orders/${orderId}/refunds/${refundId}`, {
+    method: "GET",
+  });
+
+  if (!result.ok || !result.data.cf_refund_id) {
+    throw new Error(result.error ?? "Failed to fetch refund status from Cashfree");
+  }
+
+  return {
+    cfPaymentId:       result.data.cf_payment_id,
+    cfRefundId:        result.data.cf_refund_id,
+    orderId:           result.data.order_id ?? orderId,
+    refundId:          result.data.refund_id ?? refundId,
+    refundAmount:      result.data.refund_amount ?? 0,
+    refundCurrency:    result.data.refund_currency ?? "INR",
+    refundStatus:      result.data.refund_status ?? "PENDING",
+    refundNote:        result.data.refund_note ?? "",
+    statusDescription: result.data.status_description,
+    processedAt:       result.data.created_at,
   };
 }
 
@@ -283,15 +393,11 @@ function extractPaymentMethod(method: Record<string, unknown>): string {
 /**
  * Verify the Cashfree webhook signature.
  *
- * Cashfree signs webhooks using the following procedure:
+ * Cashfree signs webhooks using HMAC-SHA256:
  *   1. Concatenate: timestamp + raw request body (as string)
- *   2. Compute HMAC-SHA256 using CASHFREE_CLIENT_SECRET as the key
+ *   2. Compute HMAC-SHA256 using CASHFREE_WEBHOOK_SECRET (or CASHFREE_CLIENT_SECRET) as the key
  *   3. Base64-encode the result
  *   4. Compare with the x-webhook-signature header
- *
- * Source: https://docs.cashfree.com/docs/webhook-security
- *
- * @returns true if the signature is valid
  */
 export function verifyCashfreeWebhookSignature(
   rawBody:   string,

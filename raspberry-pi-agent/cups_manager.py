@@ -22,6 +22,7 @@ class CupsManager:
         Returns a dict with readiness flags and raw details.
         """
         status = {
+            "cups_reachable": True,
             "kyocera_ready": True,
             "canon_ready": True,
             "kyocera_status": "idle",
@@ -56,9 +57,11 @@ class CupsManager:
                     else:
                         status["canon_ready"] = False
             else:
+                status["cups_reachable"] = False
                 logger.warning(f"lpstat -p returned non-zero ({res.returncode}): {res.stderr}")
         except FileNotFoundError:
             # lpstat not installed on dev machine — simulate ready
+            status["cups_reachable"] = True
             logger.debug("lpstat command not found. Simulating printers ready for dev environment.")
         except Exception as e:
             logger.error(f"Error checking printer status: {e}")
@@ -140,3 +143,99 @@ class CupsManager:
             return res.returncode == 0
         except Exception:
             return False
+
+    def get_job_progress(self, cups_job_id: str) -> Dict[str, Any]:
+        """
+        Query CUPS for authentic job progress attributes:
+        - job-impressions-completed: printed sides / logical impressions
+        - job-media-sheets-completed: physical sheets passed through
+        - job-state: pending (3), processing (5), stopped (6), canceled (7), aborted (8), completed (9)
+        """
+        result = {
+            "state": "unknown",
+            "impressions_completed": 0,
+            "sheets_completed": 0,
+            "is_active": True,
+            "verified": False,
+        }
+
+        if not cups_job_id:
+            return result
+
+        # Check PyCUPS if installed
+        try:
+            import cups
+            conn = cups.Connection()
+            job_num = int(cups_job_id.split("-")[-1]) if "-" in cups_job_id else int(cups_job_id)
+            attrs = conn.getJobAttributes(job_num)
+            if attrs:
+                state_code = attrs.get("job-state", 0)
+                impr = attrs.get("job-impressions-completed", 0)
+                sheets = attrs.get("job-media-sheets-completed", 0)
+
+                state_map = {
+                    3: "pending",
+                    4: "held",
+                    5: "processing",
+                    6: "stopped",
+                    7: "canceled",
+                    8: "aborted",
+                    9: "completed",
+                }
+                result["state"] = state_map.get(state_code, "processing")
+                result["impressions_completed"] = int(impr)
+                result["sheets_completed"] = int(sheets)
+                result["is_active"] = state_code in (3, 4, 5)
+                result["verified"] = True
+                return result
+        except (ImportError, ValueError, Exception):
+            pass
+
+        # Check via lpstat CLI
+        try:
+            res = subprocess.run(["lpstat", "-l", cups_job_id], capture_output=True, text=True, timeout=5)
+            if res.returncode == 0:
+                output = res.stdout.lower()
+                # Search for impressions
+                impr_match = re.search(r"job-impressions-completed[:=]\s*(\d+)", output)
+                if impr_match:
+                    result["impressions_completed"] = int(impr_match.group(1))
+
+                sheets_match = re.search(r"job-media-sheets-completed[:=]\s*(\d+)", output)
+                if sheets_match:
+                    result["sheets_completed"] = int(sheets_match.group(1))
+
+                if "completed" in output or "finished" in output:
+                    result["state"] = "completed"
+                    result["is_active"] = False
+                elif "stopped" in output or "failed" in output:
+                    result["state"] = "stopped"
+                    result["is_active"] = False
+                elif "canceled" in output or "cancelled" in output:
+                    result["state"] = "canceled"
+                    result["is_active"] = False
+                else:
+                    result["state"] = "processing"
+                    result["is_active"] = True
+
+                result["verified"] = True
+                return result
+            else:
+                # Job not found in active list — check completed jobs
+                comp_res = subprocess.run(["lpstat", "-W", "completed", "-l", cups_job_id], capture_output=True, text=True, timeout=5)
+                if comp_res.returncode == 0 and comp_res.stdout:
+                    result["state"] = "completed"
+                    result["is_active"] = False
+                    result["verified"] = True
+                    return result
+        except FileNotFoundError:
+            # lpstat not on dev host
+            if cups_job_id.startswith("sim-"):
+                result["state"] = "completed"
+                result["is_active"] = False
+                result["verified"] = False
+                return result
+        except Exception as e:
+            logger.debug(f"Could not read lpstat progress for {cups_job_id}: {e}")
+
+        return result

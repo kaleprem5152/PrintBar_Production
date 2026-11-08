@@ -1,11 +1,19 @@
 import "server-only";
-import { randomBytes } from "crypto";
-import { and, desc, eq, gt, inArray } from "drizzle-orm";
+import { createHmac, randomBytes } from "crypto";
+import { and, desc, eq, gt, inArray, or } from "drizzle-orm";
 import { db } from "@/db";
 import { auditEvents, devices, orders, type OrderDoc } from "@/db/schema";
 import { PIN_TTL_HOURS } from "@/lib/config";
 
 export type OrderRow = typeof orders.$inferSelect;
+
+// ─── PIN Hashing ─────────────────────────────────────────────────────────────
+
+/** Computes a keyed HMAC-SHA256 hash for secure PIN comparison & storage */
+export function hashPin(pin: string): string {
+  const salt = process.env.PIN_SALT || process.env.CASHFREE_CLIENT_SECRET || "printbar-pin-salt-production-2026";
+  return createHmac("sha256", salt).update(pin.trim()).digest("hex");
+}
 
 // ─── Order references ─────────────────────────────────────────────────────────
 
@@ -19,7 +27,7 @@ export function expiryFromNow() {
   return new Date(Date.now() + PIN_TTL_HOURS * 3600 * 1000);
 }
 
-// ─── In-Memory Fallback Store (When Postgres is not connected) ─────────────────
+// ─── In-Memory Fallback Store (Only for Dev / Isolated Demo) ───────────────────
 
 const DEMO_DOC: OrderDoc = {
   id: "demo-semester-notes",
@@ -51,13 +59,21 @@ function initMemoryStore() {
     paperSize: "A4",
     sides: "single",
     orientation: "portrait",
+    pagesPerSheet: 1,
+    physicalSheets: 30,
+    billingBasis: "sheet",
     amount: 60,
+    amountPaise: 6000,
     rateApplied: 2,
     pagesToPrint: 30,
+    pricingSnapshot: null,
     cashfreeOrderId: null,
     cashfreePaymentId: null,
     paidAt: new Date(),
     pin: "4827",
+    pinHash: hashPin("4827"),
+    pinAttempts: 0,
+    pinLockedUntil: null,
     expiresAt: new Date(Date.now() + 1000 * 3600 * 24 * 365),
     deviceId: "PB-K01",
     printerUsed: "kyocera_pa3500x",
@@ -67,12 +83,19 @@ function initMemoryStore() {
     printStartedAt: null,
     printClaimedAt: null,
     pagesPrinted: 0,
+    sheetsPrinted: 0,
     printBaseline: 0,
     fallbackAt: null,
     completedAt: null,
     failureReason: null,
+    refundStatus: "NOT_REQUIRED",
+    refundedAmount: 0,
+    refundableAmount: 0,
     filesDeleted: false,
     filesDeletedAt: null,
+    cleanupStatus: "PENDING",
+    cleanupAttempts: 0,
+    cleanupError: null,
     isDemo: true,
     createdAt: new Date(),
     updatedAt: new Date(),
@@ -90,13 +113,21 @@ function initMemoryStore() {
     paperSize: "A4",
     sides: "single",
     orientation: "portrait",
+    pagesPerSheet: 1,
+    physicalSheets: 8,
+    billingBasis: "sheet",
     amount: 64,
+    amountPaise: 6400,
     rateApplied: 8,
     pagesToPrint: 8,
+    pricingSnapshot: null,
     cashfreeOrderId: null,
     cashfreePaymentId: null,
     paidAt: new Date(Date.now() - 1000 * 3600 * 48),
     pin: "0000",
+    pinHash: hashPin("0000"),
+    pinAttempts: 0,
+    pinLockedUntil: null,
     expiresAt: new Date(Date.now() - 1000 * 3600 * 24),
     deviceId: "PB-K01",
     printerUsed: "canon_gx6170",
@@ -106,12 +137,19 @@ function initMemoryStore() {
     printStartedAt: null,
     printClaimedAt: null,
     pagesPrinted: 8,
+    sheetsPrinted: 8,
     printBaseline: 0,
     fallbackAt: null,
     completedAt: null,
     failureReason: null,
+    refundStatus: "NOT_REQUIRED",
+    refundedAmount: 0,
+    refundableAmount: 0,
     filesDeleted: true,
     filesDeletedAt: new Date(),
+    cleanupStatus: "CLEANED",
+    cleanupAttempts: 1,
+    cleanupError: null,
     isDemo: true,
     createdAt: new Date(Date.now() - 1000 * 3600 * 48),
     updatedAt: new Date(Date.now() - 1000 * 3600 * 48),
@@ -129,6 +167,9 @@ function initMemoryStore() {
     lastHeartbeat: new Date(),
     kyoceraReady: true,
     canonReady: true,
+    paperReady: true,
+    kyoceraPaper: 250,
+    canonPaper: 250,
     maintenanceMode: false,
     createdAt: new Date(),
     updatedAt: new Date(),
@@ -143,6 +184,9 @@ function initMemoryStore() {
     lastHeartbeat: new Date(),
     kyoceraReady: true,
     canonReady: true,
+    paperReady: true,
+    kyoceraPaper: 250,
+    canonPaper: 250,
     maintenanceMode: false,
     createdAt: new Date(),
     updatedAt: new Date(),
@@ -157,6 +201,9 @@ function initMemoryStore() {
     lastHeartbeat: new Date(),
     kyoceraReady: true,
     canonReady: true,
+    paperReady: true,
+    kyoceraPaper: 250,
+    canonPaper: 250,
     maintenanceMode: false,
     createdAt: new Date(),
     updatedAt: new Date(),
@@ -431,12 +478,21 @@ export async function createOrderRecord(data: {
   paperSize: string;
   sides: "single" | "double";
   orientation: "portrait" | "landscape";
+  pagesPerSheet?: number;
+  physicalSheets?: number;
+  billingBasis?: "sheet" | "page" | "per_sheet" | "per_side";
   amount: number;
+  amountPaise?: number;
   rateApplied: number;
   pagesToPrint: number;
+  pricingSnapshot?: Record<string, unknown> | null;
   isDemo?: boolean;
 }): Promise<OrderRow> {
   const isDemo = data.isDemo ?? false;
+  const pagesPerSheet = data.pagesPerSheet ?? 1;
+  const physicalSheets = data.physicalSheets ?? Math.ceil(data.pagesToPrint / pagesPerSheet);
+  const billingBasis = data.billingBasis ?? "sheet";
+  const amountPaise = data.amountPaise ?? Math.round(data.amount * 100);
 
   try {
     const tmpId = `TMP-${randomBytes(6).toString("hex")}`;
@@ -453,9 +509,14 @@ export async function createOrderRecord(data: {
         paperSize: data.paperSize,
         sides: data.sides,
         orientation: data.orientation,
+        pagesPerSheet,
+        physicalSheets,
+        billingBasis,
         amount: data.amount,
+        amountPaise,
         rateApplied: data.rateApplied,
         pagesToPrint: data.pagesToPrint,
+        pricingSnapshot: data.pricingSnapshot ?? null,
         isDemo,
       })
       .returning();
@@ -469,6 +530,11 @@ export async function createOrderRecord(data: {
 
     return finalRow ?? { ...inserted, orderId };
   } catch (err) {
+    if (process.env.NODE_ENV === "production" && !isDemo) {
+      console.error("[orders] Database failure creating production order:", err);
+      throw new Error(`Database unavailable for order creation: ${(err as Error).message}`);
+    }
+
     console.warn("[orders] Database insert unavailable, using resilient fallback store:", (err as Error).message);
     const memId = nextMemoryId++;
     const orderId = newOrderRef(memId);
@@ -484,13 +550,21 @@ export async function createOrderRecord(data: {
       paperSize: data.paperSize,
       sides: data.sides,
       orientation: data.orientation,
+      pagesPerSheet,
+      physicalSheets,
+      billingBasis,
       amount: data.amount,
+      amountPaise,
       rateApplied: data.rateApplied,
       pagesToPrint: data.pagesToPrint,
+      pricingSnapshot: data.pricingSnapshot ?? null,
       cashfreeOrderId: null,
       cashfreePaymentId: null,
       paidAt: null,
       pin: null,
+      pinHash: null,
+      pinAttempts: 0,
+      pinLockedUntil: null,
       expiresAt: null,
       deviceId: "PB-K01",
       printerUsed: data.colorMode === "color" ? "canon_gx6170" : "kyocera_pa3500x",
@@ -500,12 +574,19 @@ export async function createOrderRecord(data: {
       printStartedAt: null,
       printClaimedAt: null,
       pagesPrinted: 0,
+      sheetsPrinted: 0,
       printBaseline: 0,
       fallbackAt: null,
       completedAt: null,
       failureReason: null,
+      refundStatus: "NOT_REQUIRED",
+      refundedAmount: 0,
+      refundableAmount: 0,
       filesDeleted: false,
       filesDeletedAt: null,
+      cleanupStatus: "PENDING",
+      cleanupAttempts: 0,
+      cleanupError: null,
       isDemo: true, // Always allow demo printing for local fallback
       createdAt: new Date(),
       updatedAt: new Date(),
@@ -521,8 +602,11 @@ export async function findByOrderId(orderId: string): Promise<OrderRow | null> {
   try {
     const [o] = await db.select().from(orders).where(eq(orders.orderId, orderId));
     if (o) return o.isDemo ? advance(o) : o;
-  } catch {
-    /* fallback to memory store */
+  } catch (err) {
+    if (process.env.NODE_ENV === "production") {
+      console.error("[orders] Database error in findByOrderId:", err);
+      throw err;
+    }
   }
 
   const mem = memoryOrders.get(orderId);
@@ -539,8 +623,11 @@ export async function findByToken(orderId: string, token: string): Promise<Order
       .from(orders)
       .where(and(eq(orders.orderId, orderId), eq(orders.token, token)));
     if (o) return o.isDemo ? advance(o) : o;
-  } catch {
-    /* fallback to memory store */
+  } catch (err) {
+    if (process.env.NODE_ENV === "production") {
+      console.error("[orders] Database error in findByToken:", err);
+      throw err;
+    }
   }
 
   const mem = memoryOrders.get(orderId);
@@ -566,8 +653,11 @@ export async function updateOrderPaymentState(params: {
       .where(eq(orders.orderId, params.orderId))
       .returning();
     if (u) return u;
-  } catch {
-    /* fallback to memory store */
+  } catch (err) {
+    if (process.env.NODE_ENV === "production") {
+      console.error("[orders] Database error in updateOrderPaymentState:", err);
+      throw err;
+    }
   }
 
   const mem = memoryOrders.get(params.orderId);
@@ -588,6 +678,7 @@ export async function markOrderPaid(params: {
 }): Promise<OrderRow> {
   const now = new Date();
   const expiresAt = expiryFromNow();
+  const pinHash = hashPin(params.pin);
 
   try {
     const [u] = await db
@@ -595,6 +686,9 @@ export async function markOrderPaid(params: {
       .set({
         status: "paid",
         pin: params.pin,
+        pinHash,
+        pinAttempts: 0,
+        pinLockedUntil: null,
         cashfreePaymentId: params.paymentId,
         paidAt: now,
         expiresAt,
@@ -603,14 +697,20 @@ export async function markOrderPaid(params: {
       .where(eq(orders.orderId, params.orderId))
       .returning();
     if (u) return u;
-  } catch {
-    /* fallback to memory store */
+  } catch (err) {
+    if (process.env.NODE_ENV === "production") {
+      console.error("[orders] Database error in markOrderPaid:", err);
+      throw err;
+    }
   }
 
   const mem = memoryOrders.get(params.orderId);
   if (mem) {
     mem.status = "paid";
     mem.pin = params.pin;
+    mem.pinHash = pinHash;
+    mem.pinAttempts = 0;
+    mem.pinLockedUntil = null;
     mem.cashfreePaymentId = params.paymentId;
     mem.paidAt = now;
     mem.expiresAt = expiresAt;
@@ -623,6 +723,7 @@ export async function markOrderPaid(params: {
 
 export async function findOrderByPin(pin: string): Promise<OrderRow | null> {
   await ensureSeed();
+  const hashed = hashPin(pin);
 
   try {
     const [o] = await db
@@ -630,7 +731,7 @@ export async function findOrderByPin(pin: string): Promise<OrderRow | null> {
       .from(orders)
       .where(
         and(
-          eq(orders.pin, pin),
+          or(eq(orders.pin, pin), eq(orders.pinHash, hashed)),
           inArray(orders.status, [
             "paid",
             "pin_accepted",
@@ -646,14 +747,43 @@ export async function findOrderByPin(pin: string): Promise<OrderRow | null> {
       )
       .orderBy(desc(orders.id));
     if (o) return o;
-  } catch {
-    /* fallback to memory */
+  } catch (err) {
+    if (process.env.NODE_ENV === "production") {
+      console.error("[orders] Database error in findOrderByPin:", err);
+      throw err;
+    }
   }
 
   for (const o of memoryOrders.values()) {
-    if (o.pin === pin) return o;
+    if (o.pin === pin || o.pinHash === hashed) return o;
   }
   return null;
+}
+
+export async function recordFailedPinAttempt(orderId: string): Promise<{ locked: boolean; lockedUntil?: Date }> {
+  try {
+    const [order] = await db.select().from(orders).where(eq(orders.orderId, orderId));
+    if (!order) return { locked: false };
+
+    const newAttempts = (order.pinAttempts ?? 0) + 1;
+    let lockedUntil: Date | null = null;
+    if (newAttempts >= 5) {
+      lockedUntil = new Date(Date.now() + 15 * 60 * 1000); // 15-minute lock
+    }
+
+    await db
+      .update(orders)
+      .set({
+        pinAttempts: newAttempts,
+        pinLockedUntil: lockedUntil,
+        updatedAt: new Date(),
+      })
+      .where(eq(orders.orderId, orderId));
+
+    return { locked: !!lockedUntil, lockedUntil: lockedUntil ?? undefined };
+  } catch {
+    return { locked: false };
+  }
 }
 
 export async function updateOrderStatus(orderId: string, status: typeof orders.$inferSelect["status"]): Promise<OrderRow | null> {
@@ -664,8 +794,11 @@ export async function updateOrderStatus(orderId: string, status: typeof orders.$
       .where(eq(orders.orderId, orderId))
       .returning();
     if (u) return u;
-  } catch {
-    /* fallback to memory */
+  } catch (err) {
+    if (process.env.NODE_ENV === "production") {
+      console.error("[orders] Database error in updateOrderStatus:", err);
+      throw err;
+    }
   }
 
   const mem = memoryOrders.get(orderId);
@@ -683,8 +816,11 @@ export async function listRecentOrders(limit = 50): Promise<OrderRow[]> {
   try {
     const list = await db.select().from(orders).orderBy(desc(orders.id)).limit(limit);
     if (list.length > 0) return list;
-  } catch {
-    /* fallback to memory */
+  } catch (err) {
+    if (process.env.NODE_ENV === "production") {
+      console.error("[orders] Database error in listRecentOrders:", err);
+      throw err;
+    }
   }
 
   return Array.from(memoryOrders.values())
@@ -711,33 +847,42 @@ export function toPublic(o: OrderRow, withPin: boolean) {
   const progress = o.pagesToPrint ? Math.round((o.pagesPrinted / o.pagesToPrint) * 100) : 0;
 
   return {
-    orderId:         o.orderId,
-    status:          o.status,
-    docs:            docs.map((d) => ({
+    orderId:          o.orderId,
+    status:           o.status,
+    docs:             docs.map((d) => ({
       name:     d.name,
       pages:    d.pages,
       selected: d.selected,
       range:    d.range,
       size:     d.size,
     })),
-    pagesPerCopy:    o.pagesPerCopy,
-    copies:          o.copies,
-    colorMode:       o.colorMode as "bw" | "color",
-    paperSize:       o.paperSize,
-    sides:           o.sides as "single" | "double",
-    orientation:     o.orientation,
-    amount:          o.amount,
-    totalPages:      o.pagesToPrint,
-    pagesPrinted:    o.pagesPrinted,
-    pagesRemaining:  Math.max(0, o.pagesToPrint - o.pagesPrinted),
+    pagesPerCopy:     o.pagesPerCopy,
+    copies:           o.copies,
+    colorMode:        o.colorMode as "bw" | "color",
+    paperSize:        o.paperSize,
+    sides:            o.sides as "single" | "double",
+    orientation:      o.orientation,
+    pagesPerSheet:    o.pagesPerSheet ?? 1,
+    physicalSheets:   o.physicalSheets ?? Math.ceil(o.pagesToPrint / (o.pagesPerSheet ?? 1)),
+    billingBasis:     o.billingBasis ?? "sheet",
+    amount:           o.amount,
+    amountPaise:      o.amountPaise ?? Math.round(o.amount * 100),
+    totalPages:       o.pagesToPrint,
+    pagesPrinted:     o.pagesPrinted,
+    sheetsPrinted:    o.sheetsPrinted ?? 0,
+    pagesRemaining:   Math.max(0, o.pagesToPrint - o.pagesPrinted),
     progress,
-    currentDocument: currentDocument(o),
-    failureReason:   o.failureReason,
-    filesDeleted:    o.filesDeleted,
-    pin:             showPin ? o.pin : null,
-    paidAt:          o.paidAt,
-    expiresAt:       o.expiresAt,
-    completedAt:     o.completedAt,
+    currentDocument:  currentDocument(o),
+    failureReason:    o.failureReason,
+    refundStatus:     o.refundStatus ?? "NOT_REQUIRED",
+    refundedAmount:   o.refundedAmount ?? 0,
+    refundableAmount: o.refundableAmount ?? 0,
+    cleanupStatus:    o.cleanupStatus ?? "PENDING",
+    filesDeleted:     o.filesDeleted,
+    pin:              showPin ? o.pin : null,
+    paidAt:           o.paidAt,
+    expiresAt:        o.expiresAt,
+    completedAt:      o.completedAt,
   };
 }
 

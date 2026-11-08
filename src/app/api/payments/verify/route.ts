@@ -35,8 +35,17 @@ export async function POST(req: Request) {
 
   // Handle Simulation / Test Mode Payment
   const isSim = isSimulation || order.cashfreeOrderId?.startsWith("sim_") || !isCashfreeConfigured();
+  const allowSimulation = process.env.NODE_ENV !== "production" && process.env.ALLOW_PAYMENT_SIMULATION === "true";
 
   if (isSim) {
+    if (!allowSimulation) {
+      console.error("[verify] Attempted simulated payment in production environment without explicit override");
+      return Response.json(
+        { error: "Simulated payments are strictly disabled in production. Official Cashfree payment verification required." },
+        { status: 403 }
+      );
+    }
+
     const pin = await generatePin();
     const paymentId = `sim_pay_${randomBytes(6).toString("hex")}`;
     const updated = await markOrderPaid({

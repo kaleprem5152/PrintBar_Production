@@ -38,6 +38,7 @@ export function PaymentSheet({
   const [error, setError] = useState("");
   const [mode, setMode] = useState<PaymentMode>("cashfree");
   const [simulateFail, setSimulateFail] = useState(false);
+  const [simulationAllowed, setSimulationAllowed] = useState(false);
 
   useEffect(() => {
     const prev = document.body.style.overflow;
@@ -53,9 +54,14 @@ export function PaymentSheet({
     setError("");
 
     // ─────────────────────────────────────────────────────────────
-    // Flow A: Instant Test / Simulation (No money charged)
+    // Flow A: Instant Test / Simulation (Dev / Explicit test only)
     // ─────────────────────────────────────────────────────────────
     if (mode === "instant") {
+      if (!simulationAllowed) {
+        setError("Test simulation is disabled in production. Please use Cashfree.");
+        return;
+      }
+
       setPhase("simulating");
       await new Promise((resolve) => setTimeout(resolve, 800));
 
@@ -109,14 +115,21 @@ export function PaymentSheet({
         throw new Error(data.error ?? "Failed to initialize payment gateway.");
       }
 
+      if (data.isSimulationAllowed) {
+        setSimulationAllowed(true);
+      }
+
       // If order is already paid:
       if (data.paid) {
         onPaid();
         return;
       }
 
-      // If Cashfree is not configured in .env, fallback to simulation
+      // If Cashfree is not configured in .env:
       if (!data.isConfigured || data.isSimulation) {
+        if (!data.isSimulationAllowed) {
+          throw new Error("Cashfree payment gateway is unavailable. Please notify the kiosk operator.");
+        }
         setMode("instant");
         setPhase("simulating");
         await new Promise((resolve) => setTimeout(resolve, 700));
@@ -267,9 +280,9 @@ export function PaymentSheet({
             {/* Mode Selector */}
             <div>
               <p className="mb-2.5 text-[12px] font-semibold uppercase tracking-wider text-mute">
-                Select payment method
+                Payment method
               </p>
-              <div className="grid grid-cols-2 gap-2.5">
+              <div className={`grid ${simulationAllowed ? "grid-cols-2" : "grid-cols-1"} gap-2.5`}>
                 {/* Cashfree PG */}
                 <button
                   type="button"
@@ -284,39 +297,41 @@ export function PaymentSheet({
                     <span className={`inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wider ${
                       mode === "cashfree" ? "bg-amber-400 text-black" : "bg-emerald-50 text-emerald-700"
                     }`}>
-                      Live PG
+                      Live Official Gateway
                     </span>
                     <Icon name="zap" size={17} className={mode === "cashfree" ? "text-amber-400" : "text-signal"} />
                   </div>
-                  <span className="mt-2.5 text-[14.5px] font-bold leading-tight">Cashfree Gateway</span>
+                  <span className="mt-2.5 text-[14.5px] font-bold leading-tight">Cashfree Payments</span>
                   <span className={`mt-1 text-[11.5px] leading-tight ${mode === "cashfree" ? "text-white/70" : "text-mute"}`}>
-                    UPI QR · GPay · Cards · NetBanking
+                    Instant UPI QR · Google Pay · PhonePe · Paytm · Cards · NetBanking
                   </span>
                 </button>
 
-                {/* Instant Sandbox Simulation */}
-                <button
-                  type="button"
-                  onClick={() => setMode("instant")}
-                  className={`flex flex-col items-start rounded-2xl border p-4 text-left transition ${
-                    mode === "instant"
-                      ? "border-ink bg-ink text-white shadow-md"
-                      : "border-line bg-white hover:border-ink/30 text-ink"
-                  }`}
-                >
-                  <div className="flex w-full items-center justify-between">
-                    <span className={`inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wider ${
-                      mode === "instant" ? "bg-amber-400 text-black" : "bg-blue-50 text-blue-700"
-                    }`}>
-                      Free Test
+                {/* Instant Sandbox Simulation (Dev only) */}
+                {simulationAllowed && (
+                  <button
+                    type="button"
+                    onClick={() => setMode("instant")}
+                    className={`flex flex-col items-start rounded-2xl border p-4 text-left transition ${
+                      mode === "instant"
+                        ? "border-ink bg-ink text-white shadow-md"
+                        : "border-line bg-white hover:border-ink/30 text-ink"
+                    }`}
+                  >
+                    <div className="flex w-full items-center justify-between">
+                      <span className={`inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wider ${
+                        mode === "instant" ? "bg-amber-400 text-black" : "bg-blue-50 text-blue-700"
+                      }`}>
+                        Free Test
+                      </span>
+                      <Icon name="check" size={17} className={mode === "instant" ? "text-amber-400" : "text-ok"} />
+                    </div>
+                    <span className="mt-2.5 text-[14.5px] font-bold leading-tight">Dev Sandbox</span>
+                    <span className={`mt-1 text-[11.5px] leading-tight ${mode === "instant" ? "text-white/70" : "text-mute"}`}>
+                      Simulate payment without real money
                     </span>
-                    <Icon name="check" size={17} className={mode === "instant" ? "text-amber-400" : "text-ok"} />
-                  </div>
-                  <span className="mt-2.5 text-[14.5px] font-bold leading-tight">1-Click Sandbox</span>
-                  <span className={`mt-1 text-[11.5px] leading-tight ${mode === "instant" ? "text-white/70" : "text-mute"}`}>
-                    Simulate payment without real money
-                  </span>
-                </button>
+                  </button>
+                )}
               </div>
             </div>
 

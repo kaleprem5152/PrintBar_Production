@@ -1,7 +1,7 @@
 "use client";
 
 import { Icon } from "@/components/ui/Icon";
-import { parsePageRange } from "@/lib/pricing";
+import { parsePageRange, type PagesPerSheet } from "@/lib/pricing";
 import { rupees, type ColorMode, type Orientation, type Sides } from "@/lib/config";
 import type { Cfg, Settings, UDoc } from "./types";
 
@@ -17,7 +17,7 @@ function Group({ title, hint, children }: { title: string; hint?: string; childr
   );
 }
 
-function Seg<T extends string>({
+function Seg<T extends string | number>({
   value,
   options,
   onChange,
@@ -34,13 +34,13 @@ function Seg<T extends string>({
         const on = o.value === value;
         return (
           <button
-            key={o.value}
+            key={String(o.value)}
             type="button"
             role="radio"
             aria-checked={on}
             onClick={() => onChange(o.value)}
             className={`flex min-h-[52px] items-center justify-center gap-2 rounded-2xl border px-3 py-2 text-[14.5px] font-medium transition active:scale-[0.98] ${
-              on ? "border-ink bg-ink text-paper" : "border-line bg-white hover:border-ink/40"
+              on ? "border-ink bg-ink text-paper shadow-xs" : "border-line bg-white hover:border-ink/40"
             }`}
           >
             {o.icon}
@@ -57,6 +57,44 @@ function Seg<T extends string>({
 
 function Sheet({ landscape }: { landscape?: boolean }) {
   return <span className={`block rounded-[3px] border-[1.5px] border-current ${landscape ? "h-3.5 w-5" : "h-5 w-3.5"}`} />;
+}
+
+function NUpLayoutIcon({ count }: { count: PagesPerSheet }) {
+  if (count === 1) {
+    return (
+      <span className="flex h-5 w-4 items-center justify-center rounded-[2px] border border-current p-0.5">
+        <span className="h-full w-full rounded-[1px] bg-current opacity-40" />
+      </span>
+    );
+  }
+  if (count === 2) {
+    return (
+      <span className="flex h-4 w-5 flex-col gap-0.5 rounded-[2px] border border-current p-0.5">
+        <span className="h-full w-full rounded-[1px] bg-current opacity-40" />
+        <span className="h-full w-full rounded-[1px] bg-current opacity-40" />
+      </span>
+    );
+  }
+  if (count === 4) {
+    return (
+      <span className="grid h-5 w-4 grid-cols-2 gap-0.5 rounded-[2px] border border-current p-0.5">
+        <span className="rounded-[1px] bg-current opacity-40" />
+        <span className="rounded-[1px] bg-current opacity-40" />
+        <span className="rounded-[1px] bg-current opacity-40" />
+        <span className="rounded-[1px] bg-current opacity-40" />
+      </span>
+    );
+  }
+  return (
+    <span className="grid h-5 w-4 grid-cols-2 grid-rows-3 gap-0.5 rounded-[2px] border border-current p-0.5">
+      <span className="rounded-[1px] bg-current opacity-40" />
+      <span className="rounded-[1px] bg-current opacity-40" />
+      <span className="rounded-[1px] bg-current opacity-40" />
+      <span className="rounded-[1px] bg-current opacity-40" />
+      <span className="rounded-[1px] bg-current opacity-40" />
+      <span className="rounded-[1px] bg-current opacity-40" />
+    </span>
+  );
 }
 
 export function SettingsPanel({
@@ -111,13 +149,44 @@ export function SettingsPanel({
                   </span>
                   <span className="block text-[15px] font-semibold leading-tight">{o.label}</span>
                   <span className={`mt-1 block text-[13px] ${on ? "text-paper/70" : "text-mute"}`}>
-                    <b className="text-[17px] font-semibold">{rupees(o.price)}</b>/page
+                    <b className="text-[17px] font-semibold">{rupees(o.price)}</b>/sheet
                   </span>
                   {on && (
                     <span className="absolute right-3 top-3 flex h-6 w-6 items-center justify-center rounded-full bg-signal text-white">
                       <Icon name="check" size={14} strokeWidth={2.6} />
                     </span>
                   )}
+                </button>
+              );
+            })}
+          </div>
+        </Group>
+
+        <Group title="Pages per sheet" hint="Save paper with N-up layout">
+          <div role="radiogroup" aria-label="Pages per sheet" className="grid grid-cols-4 gap-2">
+            {(
+              [
+                { v: 1, label: "1-up", sub: "Standard" },
+                { v: 2, label: "2-up", sub: "2 on 1" },
+                { v: 4, label: "4-up", sub: "4 on 1" },
+                { v: 6, label: "6-up", sub: "6 on 1" },
+              ] as const
+            ).map((o) => {
+              const on = (settings.pagesPerSheet || 1) === o.v;
+              return (
+                <button
+                  key={o.v}
+                  type="button"
+                  role="radio"
+                  aria-checked={on}
+                  onClick={() => set("pagesPerSheet", o.v)}
+                  className={`flex min-h-[58px] flex-col items-center justify-center gap-1 rounded-2xl border p-2 text-center transition active:scale-[0.98] ${
+                    on ? "border-ink bg-ink text-paper shadow-xs" : "border-line bg-white hover:border-ink/40"
+                  }`}
+                >
+                  <NUpLayoutIcon count={o.v} />
+                  <span className="text-[13px] font-semibold leading-tight">{o.label}</span>
+                  <span className={`text-[11px] ${on ? "text-paper/70" : "text-mute"}`}>{o.sub}</span>
                 </button>
               );
             })}
@@ -164,7 +233,7 @@ export function SettingsPanel({
           <Seg
             label="Paper size"
             value={settings.paperSize}
-            onChange={(v) => set("paperSize", v)}
+            onChange={(v) => set("paperSize", String(v))}
             options={cfg.hardware.paperSizes.map((p) => ({ value: p, label: p, sub: p === "A4" ? "210 × 297 mm" : undefined }))}
           />
         </Group>

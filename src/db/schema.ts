@@ -29,8 +29,9 @@ export const orderStatusEnum = pgEnum("order_status", [
   "completed",         // Print confirmed complete; document deleted
   "failed",            // Terminal failure (fallback also failed or not attempted)
   "cancelled",         // Cancelled before printing
-  "refund_pending",    // Admin initiated refund
-  "refunded",          // Refund processed
+  "refund_pending",    // Refund initiated
+  "refunded",          // Refund processed successfully
+  "requires_manual_review", // Physical output or error requires operator review
 ]);
 
 export const colorModeEnum = pgEnum("color_mode", ["bw", "color"]);
@@ -52,12 +53,15 @@ export const auditEventTypeEnum = pgEnum("audit_event_type", [
   "print_failed",
   "fallback_triggered",
   "document_deleted",
+  "cleanup_failed",
   "admin_login",
   "admin_action",
   "refund_initiated",
   "refund_completed",
+  "refund_failed",
   "device_heartbeat",
   "device_auth_failed",
+  "reconciliation_matched",
 ]);
 
 // ─── Type exports ─────────────────────────────────────────────────────────────
@@ -92,19 +96,27 @@ export const orders = pgTable(
     paperSize:     text("paper_size").notNull().default("A4"),
     sides:         sidesEnum("sides").notNull().default("single"),
     orientation:   orientationEnum("orientation").notNull().default("portrait"),
+    pagesPerSheet: integer("pages_per_sheet").notNull().default(1), // 1, 2, 4, 6 (N-up layout)
+    physicalSheets: integer("physical_sheets").notNull().default(1), // Estimated sheets required
+    billingBasis:  text("billing_basis").notNull().default("per_sheet"), // 'per_sheet' | 'per_side'
 
     // ── Pricing (server-locked at order creation) ─────────────────────────────
-    amount:        integer("amount").notNull(),        // Total in rupees
-    rateApplied:   integer("rate_applied").notNull(),  // Per-page rate at time of order
+    amount:        integer("amount").notNull(),        // Total in rupees (integer)
+    amountPaise:   integer("amount_paise").notNull().default(0), // Total in integer paise
+    rateApplied:   integer("rate_applied").notNull(),  // Per-sheet / per-side rate applied
     pagesToPrint:  integer("pages_to_print").notNull(),
+    pricingSnapshot: jsonb("pricing_snapshot"),       // Immutable snapshot of pricing rules
 
     // ── Payment ───────────────────────────────────────────────────────────────
     cashfreeOrderId:   text("cashfree_order_id"),      // CF order ID for checkout
     cashfreePaymentId: text("cashfree_payment_id"),    // CF transaction reference
     paidAt:            timestamp("paid_at"),
 
-    // ── PIN ───────────────────────────────────────────────────────────────────
-    pin:           text("pin"),                        // Null after completion
+    // ── PIN Security ──────────────────────────────────────────────────────────
+    pin:           text("pin"),                        // Cleartext PIN for user lookup (nulled on completion)
+    pinHash:       text("pin_hash"),                   // Salted SHA-256 hash for secure verification
+    pinAttempts:   integer("pin_attempts").notNull().default(0), // Failed PIN verification attempts
+    pinLockedUntil: timestamp("pin_locked_until"),     // Temporary lockout after repeated failures
     expiresAt:     timestamp("expires_at"),            // PIN expiry (24h from paidAt)
 
     // ── Print execution ───────────────────────────────────────────────────────
@@ -115,15 +127,24 @@ export const orders = pgTable(
     fallbackCupsJobId: text("fallback_cups_job_id"),
     printStartedAt:    timestamp("print_started_at"),
     printClaimedAt:    timestamp("print_claimed_at"),
-    pagesPrinted:      integer("pages_printed").notNull().default(0),
+    pagesPrinted:      integer("pages_printed").notNull().default(0), // Logical pages printed
+    sheetsPrinted:     integer("sheets_printed").notNull().default(0), // Physical sheets printed
     printBaseline:     integer("print_baseline").notNull().default(0), // Pages done before resume
     fallbackAt:        timestamp("fallback_at"),       // When fallback was triggered
     completedAt:       timestamp("completed_at"),
     failureReason:     text("failure_reason"),
 
-    // ── Privacy ───────────────────────────────────────────────────────────────
-    filesDeleted:     boolean("files_deleted").notNull().default(false),
-    filesDeletedAt:   timestamp("files_deleted_at"),
+    // ── Refund Lifecycle ──────────────────────────────────────────────────────
+    refundStatus:      text("refund_status").notNull().default("NOT_REQUIRED"), // NOT_REQUIRED | REFUND_REQUESTED | REFUND_PROCESSING | REFUNDED | REFUND_FAILED | REFUND_REQUIRES_REVIEW
+    refundedAmount:    integer("refunded_amount").notNull().default(0), // In rupees
+    refundableAmount:  integer("refundable_amount"), // Calculated max refundable in rupees
+
+    // ── Privacy & Secure Deletion ─────────────────────────────────────────────
+    filesDeleted:      boolean("files_deleted").notNull().default(false),
+    filesDeletedAt:    timestamp("files_deleted_at"),
+    cleanupStatus:     text("cleanup_status").notNull().default("CLEANUP_PENDING"), // CLEANUP_PENDING | CLEANUP_IN_PROGRESS | CLEANUP_COMPLETED | CLEANUP_FAILED
+    cleanupAttempts:   integer("cleanup_attempts").notNull().default(0),
+    cleanupError:      text("cleanup_error"),
 
     // ── Metadata ──────────────────────────────────────────────────────────────
     isDemo:        boolean("is_demo").notNull().default(false),
@@ -135,6 +156,8 @@ export const orders = pgTable(
     index("orders_device_idx").on(t.deviceId),
     index("orders_cashfree_order_idx").on(t.cashfreeOrderId),
     index("orders_pin_idx").on(t.pin),
+    index("orders_refund_status_idx").on(t.refundStatus),
+    index("orders_cleanup_status_idx").on(t.cleanupStatus),
   ]
 );
 
@@ -166,6 +189,36 @@ export const paymentTransactions = pgTable(
   ]
 );
 
+// ─── refund_transactions ──────────────────────────────────────────────────────
+
+export const refundTransactions = pgTable(
+  "refund_transactions",
+  {
+    id:                   serial("id").primaryKey(),
+    orderId:              text("order_id").notNull().references(() => orders.orderId),
+    paymentTransactionId: integer("payment_transaction_id").references(() => paymentTransactions.id),
+    cashfreePaymentId:    text("cashfree_payment_id").notNull(),
+    cashfreeRefundId:     text("cashfree_refund_id").notNull().unique(), // Our unique reference sent to CF
+    requestedAmount:      integer("requested_amount").notNull(),         // In rupees
+    completedAmount:      integer("completed_amount"),                   // Confirmed by CF in rupees
+    currency:             text("currency").notNull().default("INR"),
+    reason:               text("reason").notNull(),                      // Clear human-readable reason
+    status:               text("status").notNull().default("REFUND_REQUESTED"), // NOT_REQUIRED | REFUND_REQUESTED | REFUND_PROCESSING | REFUNDED | REFUND_FAILED | REFUND_REQUIRES_REVIEW
+    initiatedBy:          text("initiated_by").notNull().default("system"), // "system" | "admin" | "kiosk_auto"
+    idempotencyKey:       text("idempotency_key").notNull().unique(),
+    failureReason:        text("failure_reason"),
+    cfResponse:           jsonb("cf_response"),
+    createdAt:            timestamp("created_at").notNull().defaultNow(),
+    updatedAt:            timestamp("updated_at").notNull().defaultNow(),
+    completedAt:          timestamp("completed_at"),
+  },
+  (t) => [
+    index("refund_transactions_order_idx").on(t.orderId),
+    index("refund_transactions_status_idx").on(t.status),
+    index("refund_transactions_cf_refund_idx").on(t.cashfreeRefundId),
+  ]
+);
+
 // ─── print_jobs ───────────────────────────────────────────────────────────────
 
 export const printJobs = pgTable(
@@ -180,6 +233,8 @@ export const printJobs = pgTable(
     isFallback:   boolean("is_fallback").notNull().default(false),
     pagesAttempted: integer("pages_attempted").notNull().default(0),
     pagesConfirmed: integer("pages_confirmed").notNull().default(0),
+    sheetsAttempted: integer("sheets_attempted").notNull().default(0),
+    sheetsConfirmed: integer("sheets_confirmed").notNull().default(0),
     startedAt:    timestamp("started_at").notNull().defaultNow(),
     completedAt:  timestamp("completed_at"),
     failedAt:     timestamp("failed_at"),
@@ -230,6 +285,9 @@ export const devices = pgTable(
     kyoceraReady:  boolean("kyocera_ready"),
     canonReady:    boolean("canon_ready"),
     maintenanceMode: boolean("maintenance_mode").notNull().default(false),
+    kyoceraPaper:  integer("kyocera_paper").notNull().default(250), // Paper tray level (sheets)
+    canonPaper:    integer("canon_paper").notNull().default(250),   // Paper tray level (sheets)
+    paperReady:    boolean("paper_ready").notNull().default(true),  // False if both are out of paper
     createdAt:     timestamp("created_at").notNull().defaultNow(),
     updatedAt:     timestamp("updated_at").notNull().defaultNow(),
   }
@@ -255,13 +313,17 @@ export const adminUsers = pgTable(
 export const pricingConfig = pgTable(
   "pricing_config",
   {
-    id:         serial("id").primaryKey(),
-    bwPerPage:  integer("bw_per_page").notNull().default(2),   // Rupees
-    colorPerPage: integer("color_per_page").notNull().default(8),
-    currency:   text("currency").notNull().default("INR"),
-    effectiveFrom: timestamp("effective_from").notNull().defaultNow(),
-    createdAt:  timestamp("created_at").notNull().defaultNow(),
-    createdBy:  text("created_by"),                            // Admin username
+    id:                  serial("id").primaryKey(),
+    bwPerPage:           integer("bw_per_page").notNull().default(2),   // Rupees
+    colorPerPage:        integer("color_per_page").notNull().default(8),
+    billingBasis:        text("billing_basis").notNull().default("per_sheet"), // "per_sheet" | "per_side"
+    minOrderAmount:      integer("min_order_amount").notNull().default(2), // Minimum order amount in Rupees
+    duplexDiscountPaise: integer("duplex_discount_paise").notNull().default(0), // Optional discount for duplex in paise
+    nupRules:            jsonb("nup_rules"),                          // Optional layout rules
+    currency:            text("currency").notNull().default("INR"),
+    effectiveFrom:       timestamp("effective_from").notNull().defaultNow(),
+    createdAt:           timestamp("created_at").notNull().defaultNow(),
+    createdBy:           text("created_by"),                          // Admin username
   }
 );
 
@@ -291,6 +353,7 @@ export const auditEvents = pgTable(
 export type OrderRow              = typeof orders.$inferSelect;
 export type OrderInsert           = typeof orders.$inferInsert;
 export type PaymentTransactionRow = typeof paymentTransactions.$inferSelect;
+export type RefundTransactionRow  = typeof refundTransactions.$inferSelect;
 export type PrintJobRow           = typeof printJobs.$inferSelect;
 export type DeviceRow             = typeof devices.$inferSelect;
 export type AdminUserRow          = typeof adminUsers.$inferSelect;

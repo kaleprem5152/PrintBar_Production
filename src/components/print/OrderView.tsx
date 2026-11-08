@@ -140,10 +140,40 @@ export function OrderView({ orderId, token, isNew, embed }: { orderId: string; t
               </div>
             )}
 
+            {/* Customer Refund Status Card */}
+            {o.refundStatus && o.refundStatus !== "NOT_REQUIRED" && (
+              <section className="rounded-[24px] border border-amber-500/20 bg-amber-500/5 p-5 md:p-6" aria-label="Refund status">
+                <div className="flex items-center gap-2.5">
+                  <span className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full ${
+                    o.refundStatus === "REFUNDED" ? "bg-emerald-500/10 text-emerald-600" : "bg-amber-500/10 text-amber-600"
+                  }`}>
+                    <Icon name={o.refundStatus === "REFUNDED" ? "check" : "shield"} size={17} />
+                  </span>
+                  <div>
+                    <h2 className="text-base font-bold text-ink">
+                      {o.refundStatus === "REFUNDED"
+                        ? "Refund Completed via Cashfree"
+                        : o.refundStatus === "REFUND_REQUIRES_REVIEW"
+                        ? "Refund Under Operational Review"
+                        : "Refund in Progress"}
+                    </h2>
+                    <p className="text-xs text-mute mt-0.5">
+                      {o.refundStatus === "REFUNDED"
+                        ? `₹${o.refundedAmount || o.amount} has been returned to your original payment method.`
+                        : o.refundStatus === "REFUND_REQUIRES_REVIEW"
+                        ? "Our team is verifying output impressions to ensure exact reimbursement for unprinted pages."
+                        : `₹${o.refundableAmount || o.amount} is being processed by Cashfree back to your account.`}
+                    </p>
+                  </div>
+                </div>
+              </section>
+            )}
+
             <section className="rounded-[24px] border border-line bg-white p-5 md:p-6" aria-label="Order details">
               <dl className="grid grid-cols-2 gap-x-4 gap-y-5 md:grid-cols-3">
                 <D k="Order ID" v={o.orderId} mono />
                 <D k="Total pages" v={`${o.totalPages}`} />
+                <D k="Physical sheets" v={`${o.physicalSheets ?? Math.ceil(o.totalPages / (o.pagesPerSheet ?? 1))} sheets (${o.pagesPerSheet ?? 1}-up)`} />
                 <D k="Copies" v={`${o.copies}`} />
                 <D k="Colour mode" v={o.colorMode === "bw" ? "Black & White" : "Colour"} />
                 <D k="Paper" v={`${o.paperSize} · ${o.sides === "single" ? "Single" : "Double"}-sided`} />

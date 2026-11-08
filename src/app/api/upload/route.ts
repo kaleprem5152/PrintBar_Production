@@ -1,6 +1,9 @@
 import { randomUUID } from "crypto";
-import { ALLOWED_EXT, HARDWARE } from "@/lib/config";
+import { ALLOWED_EXT, DEVICE_ID, HARDWARE } from "@/lib/config";
 import { countDocxPages, countPdfPages, storeFile, sweepOldFiles } from "@/lib/server/files";
+import { db } from "@/db";
+import { devices } from "@/db/schema";
+import { eq } from "drizzle-orm";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -32,6 +35,28 @@ const MIME: Record<string, string[]> = {
 };
 
 export async function POST(req: Request) {
+  // Check kiosk hardware and paper availability before accepting file
+  try {
+    const [dev] = await db.select().from(devices).where(eq(devices.id, DEVICE_ID)).limit(1);
+    if (dev) {
+      if (dev.maintenanceMode) {
+        return Response.json(
+          { error: "The PrintBar kiosk is currently in maintenance mode. Document uploads are temporarily paused." },
+          { status: 503 }
+        );
+      }
+      const totalPaper = (dev.kyoceraPaper ?? 0) + (dev.canonPaper ?? 0);
+      if (!dev.paperReady || totalPaper <= 0) {
+        return Response.json(
+          { error: "The kiosk is currently out of paper. Document uploads are paused until an operator refills the paper." },
+          { status: 503 }
+        );
+      }
+    }
+  } catch (err) {
+    // If DB check fails, continue
+  }
+
   let form: FormData;
   try {
     form = await req.formData();

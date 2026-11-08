@@ -18,6 +18,7 @@ export const HARDWARE = {
   paperSizes:       ["A4"] as string[],
   sides:            ["single", "double"] as string[],
   orientations:     ["portrait", "landscape"] as string[],
+  pagesPerSheet:    [1, 2, 4, 6] as const,
   maxUploadBytes:   25 * 1024 * 1024,  // 25 MB per file
   maxFiles:         5,                  // Maximum documents per order
 } as const;

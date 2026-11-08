@@ -19,6 +19,7 @@ type HeartbeatBody = {
   canonReady:    boolean;
   kyoceraStatus: string;
   canonStatus:   string;
+  paperReady?:   boolean;
   cupsReachable: boolean;
   agentVersion:  string;
 };
@@ -33,16 +34,23 @@ export async function POST(req: Request) {
   const body     = (await req.json().catch(() => ({}))) as HeartbeatBody;
   const now      = new Date();
 
+  const updates: Record<string, unknown> = {
+    lastHeartbeat: now,
+    kyoceraReady:  body.kyoceraReady ?? false,
+    canonReady:    body.canonReady ?? false,
+    updatedAt:     now,
+  };
+
+  if (body.paperReady !== undefined) {
+    updates.paperReady = body.paperReady;
+  }
+
   // Update device heartbeat and printer status
-  await db
+  const [device] = await db
     .update(devices)
-    .set({
-      lastHeartbeat: now,
-      kyoceraReady:  body.kyoceraReady ?? false,
-      canonReady:    body.canonReady ?? false,
-      updatedAt:     now,
-    })
-    .where(eq(devices.id, deviceId));
+    .set(updates)
+    .where(eq(devices.id, deviceId))
+    .returning();
 
   // Record printer status history for monitoring
   if (body.kyoceraStatus) {
@@ -65,8 +73,11 @@ export async function POST(req: Request) {
   }
 
   return Response.json({
-    ok:             true,
-    serverTime:     now.toISOString(),
-    maintenanceMode: false, // TODO: read from device config
+    ok:              true,
+    serverTime:      now.toISOString(),
+    maintenanceMode: device?.maintenanceMode ?? false,
+    kyoceraPaper:    device?.kyoceraPaper ?? 250,
+    canonPaper:      device?.canonPaper ?? 250,
+    paperReady:      device?.paperReady ?? true,
   });
 }

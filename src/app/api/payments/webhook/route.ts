@@ -17,9 +17,9 @@
 import "server-only";
 import { and, eq } from "drizzle-orm";
 import { db } from "@/db";
-import { orders, paymentTransactions } from "@/db/schema";
+import { orders, paymentTransactions, refundTransactions } from "@/db/schema";
 import { verifyCashfreeWebhookSignature } from "@/lib/server/cashfree";
-import { generatePin, logAuditEvent } from "@/lib/server/orders";
+import { generatePin, hashPin, logAuditEvent } from "@/lib/server/orders";
 import { PIN_TTL_HOURS } from "@/lib/config";
 
 export const dynamic = "force-dynamic";
@@ -78,7 +78,55 @@ export async function POST(req: Request) {
 
   console.log(`[webhook] Event: ${eventType} | Order: ${internalOrderId} | Payment: ${cfPaymentId} | Status: ${paymentStatus}`);
 
-  // ── 5. Only process payment events ───────────────────────────────────────
+  // ── 5. Process refund events ──────────────────────────────────────────────
+  if (eventType.startsWith("REFUND_")) {
+    const refundData = (payload.data as any)?.refund;
+    const cfRefundId = refundData?.cf_refund_id;
+    const refOrderId = refundData?.order_id || internalOrderId;
+    const rfStatus = (refundData?.refund_status || "").toUpperCase();
+    const rfAmount = Number(refundData?.refund_amount || 0);
+
+    console.log(`[webhook] Refund event: ${eventType} | Order: ${refOrderId} | CF Refund ID: ${cfRefundId} | Status: ${rfStatus}`);
+
+    if (refOrderId) {
+      const now = new Date();
+      if (rfStatus === "SUCCESS") {
+        await db
+          .update(orders)
+          .set({ refundStatus: "REFUNDED", refundedAmount: Math.round(rfAmount), updatedAt: now })
+          .where(eq(orders.orderId, refOrderId));
+
+        if (cfRefundId) {
+          await db
+            .update(refundTransactions)
+            .set({ status: "SUCCESS", completedAmount: rfAmount, completedAt: now, updatedAt: now })
+            .where(eq(refundTransactions.cashfreeRefundId, cfRefundId));
+        }
+
+        await logAuditEvent({
+          eventType: "refund_completed",
+          orderId: refOrderId,
+          details: { cfRefundId, amount: rfAmount, source: "webhook" },
+        });
+      } else if (rfStatus === "FAILED") {
+        await db
+          .update(orders)
+          .set({ refundStatus: "REFUND_FAILED", updatedAt: now })
+          .where(eq(orders.orderId, refOrderId));
+
+        if (cfRefundId) {
+          await db
+            .update(refundTransactions)
+            .set({ status: "FAILED", failureReason: refundData?.status_description || "Cashfree reported failed", updatedAt: now })
+            .where(eq(refundTransactions.cashfreeRefundId, cfRefundId));
+        }
+      }
+    }
+
+    return new Response("ok", { status: 200 });
+  }
+
+  // ── 6. Only process payment events from here ──────────────────────────────
   if (!eventType.startsWith("PAYMENT_")) {
     return new Response("ok", { status: 200 });
   }
@@ -88,7 +136,7 @@ export async function POST(req: Request) {
     return new Response("ok", { status: 200 });
   }
 
-  // ── 6. Load the order ─────────────────────────────────────────────────────
+  // ── 7. Load the order ─────────────────────────────────────────────────────
   const [order] = await db
     .select()
     .from(orders)
@@ -99,7 +147,7 @@ export async function POST(req: Request) {
     return new Response("ok", { status: 200 });
   }
 
-  // ── 7. Idempotency: skip if already processed ─────────────────────────────
+  // ── 8. Idempotency: skip if already processed ─────────────────────────────
   if (order.status === "paid" || order.status === "queued" ||
       order.status === "claimed" || order.status === "printing" ||
       order.status === "completed" || order.status === "refunded") {
@@ -107,7 +155,7 @@ export async function POST(req: Request) {
     return new Response("ok", { status: 200 });
   }
 
-  // ── 8. Check for duplicate CF payment ID in transaction log ───────────────
+  // ── 9. Check for duplicate CF payment ID in transaction log ───────────────
   if (cfPaymentId) {
     const [existing] = await db
       .select()
@@ -151,6 +199,9 @@ export async function POST(req: Request) {
           .set({
             status:            "paid",
             pin,
+            pinHash:           hashPin(pin),
+            pinAttempts:       0,
+            pinLockedUntil:    null,
             expiresAt,
             paidAt:            now,
             cashfreePaymentId: cfPaymentId,

@@ -44,6 +44,10 @@ class PrintBarAgent:
     def __init__(self):
         self.cups = CupsManager()
         self.last_heartbeat_time = 0
+        self.kyocera_paper = 250
+        self.canon_paper = 250
+        self.paper_ready = True
+        self.maintenance_mode = False
         init_db()
 
     def send_heartbeat(self):
@@ -58,12 +62,15 @@ class PrintBarAgent:
         headers["Content-Type"] = "application/json"
 
         payload = {
-            "kyoceraReady": status.get("kyocera_ready", True),
-            "canonReady":   status.get("canon_ready", True),
-            "status":       status.get("kyocera_status", "ready"),
-            "paperReady":   status.get("paper_ready", True),
-            "tonerOk":      status.get("toner_ok", True),
-            "rawPayload":   status,
+            "kyoceraReady":  status.get("kyocera_ready", True),
+            "canonReady":    status.get("canon_ready", True),
+            "kyoceraStatus": status.get("kyocera_status", "idle"),
+            "canonStatus":   status.get("canon_status", "idle"),
+            "cupsReachable": status.get("cups_reachable", True),
+            "agentVersion":  "2.4.0",
+            "paperReady":    status.get("paper_ready", True) and (self.kyocera_paper > 0 or self.canon_paper > 0),
+            "tonerOk":       status.get("toner_ok", True),
+            "rawPayload":    status,
         }
 
         try:
@@ -71,6 +78,11 @@ class PrintBarAgent:
             if res.status_code == 200:
                 logger.debug("Heartbeat successfully reported.")
                 self.last_heartbeat_time = now
+                hb_data = res.json()
+                self.kyocera_paper = hb_data.get("kyoceraPaper", 250)
+                self.canon_paper = hb_data.get("canonPaper", 250)
+                self.paper_ready = hb_data.get("paperReady", True)
+                self.maintenance_mode = hb_data.get("maintenanceMode", False)
             else:
                 logger.warning(f"Heartbeat failed with HTTP {res.status_code}: {res.text}")
         except Exception as e:
@@ -78,6 +90,14 @@ class PrintBarAgent:
 
     def poll_and_process_jobs(self):
         """Query cloud API for available jobs and process them"""
+        if self.maintenance_mode:
+            logger.info("Kiosk is currently in maintenance mode; skipping job polling.")
+            return
+
+        if not self.paper_ready or (self.kyocera_paper <= 0 and self.canon_paper <= 0):
+            logger.warning("Kiosk is out of paper; skipping job polling until paper is refilled.")
+            return
+
         url = f"{CLOUD_API_URL}/api/device/jobs"
         headers = get_auth_headers()
 
@@ -133,12 +153,15 @@ class PrintBarAgent:
     def execute_print_pipeline(self, order_id: str, job_ref: str, primary_queue: str, docs: List[Dict[str, Any]], settings: Dict[str, Any], pages_to_print: int):
         """Download files, send to CUPS, track progress, handle fallback, report completion"""
         downloaded_files: List[str] = []
+        total_pages_printed = 0
+        cups_job_id: Any = None
+        os.makedirs(str(JOB_DOWNLOAD_DIR), exist_ok=True)
+
         try:
             # Step 1: Download files
             for doc in docs:
                 doc_id = doc["id"]
                 kind = doc.get("kind", "pdf")
-                file_path = os.path.join(JOB_DOWNLOAD_DIR, f"{doc_id}.{kind}")
                 
                 dl_url = f"{CLOUD_API_URL}/api/device/jobs/{order_id}/files/{doc_id}"
                 headers = get_auth_headers()
@@ -148,6 +171,10 @@ class PrintBarAgent:
                 if dl_res.status_code != 200:
                     raise Exception(f"Failed to download doc {doc_id}: HTTP {dl_res.status_code}")
                 
+                content_type = dl_res.headers.get("Content-Type", "")
+                ext = "pdf" if "pdf" in content_type else kind
+                file_path = str(JOB_DOWNLOAD_DIR / f"{doc_id}.{ext}")
+
                 with open(file_path, "wb") as f:
                     f.write(dl_res.content)
                 downloaded_files.append(file_path)
@@ -162,11 +189,9 @@ class PrintBarAgent:
             sides = settings.get("sides", "single")
             orientation = settings.get("orientation", "portrait")
 
-            total_pages_printed = 0
-
             for file_path in downloaded_files:
                 # Submit to primary printer
-                success, cups_job_id, err = self.cups.print_file(
+                success, submitted_cups_id, err = self.cups.print_file(
                     file_path=file_path,
                     printer_queue=primary_queue,
                     copies=copies,
@@ -180,7 +205,7 @@ class PrintBarAgent:
                     # If primary Kyocera fails on B&W, attempt fallback to Canon
                     if color_mode == "bw" and primary_queue == KYOCERA_QUEUE:
                         logger.warning(f"Kyocera failed ({err}). Triggering fallback to Canon MAXIFY GX6170...")
-                        fallback_success = self.trigger_fallback(order_id, total_pages_printed, err)
+                        fallback_success = self.trigger_fallback(order_id, total_pages_printed, err, submitted_cups_id)
                         if fallback_success:
                             # Print on Canon in monochrome
                             fb_success, fb_cups_id, fb_err = self.cups.print_file(
@@ -199,17 +224,35 @@ class PrintBarAgent:
                             raise Exception(f"Kyocera failed and cloud rejected fallback: {err}")
                     else:
                         raise Exception(f"Print submission failed: {err}")
+                else:
+                    cups_job_id = submitted_cups_id
 
                 # Notify cloud printing started
                 self.report_progress(order_id, pages_printed=total_pages_printed, cups_job_id=cups_job_id, status="printing")
 
-                # Monitor printing progress
-                # For realistic progression, calculate pages and report increments
-                pages_in_doc = max(1, pages_to_print // len(downloaded_files))
-                for p in range(1, pages_in_doc + 1):
-                    time.sleep(0.8) # Average page print cycle
-                    total_pages_printed = min(pages_to_print, total_pages_printed + 1)
-                    self.report_progress(order_id, pages_printed=total_pages_printed, cups_job_id=cups_job_id)
+                # Monitor authentic CUPS printing progress
+                doc_pages_printed = 0
+                poll_start = time.time()
+                timeout = max(90, pages_to_print * 20)
+
+                while time.time() - poll_start < timeout:
+                    prog = self.cups.get_job_progress(cups_job_id)
+                    state = prog.get("state", "processing")
+                    impr = prog.get("impressions_completed", 0)
+
+                    if impr > doc_pages_printed:
+                        diff = impr - doc_pages_printed
+                        doc_pages_printed = impr
+                        total_pages_printed = min(pages_to_print, total_pages_printed + diff)
+                        self.report_progress(order_id, pages_printed=total_pages_printed, cups_job_id=cups_job_id)
+
+                    if state == "completed":
+                        logger.info(f"CUPS reported job {cups_job_id} completed successfully.")
+                        break
+                    elif state in ("stopped", "canceled", "aborted"):
+                        raise Exception(f"Hardware interrupt: CUPS job {cups_job_id} transitioned to state '{state}'")
+
+                    time.sleep(1.0)
 
             # Step 4: Report Completion
             self.report_complete(order_id, pages_printed=pages_to_print, cups_job_id=cups_job_id)
@@ -217,21 +260,25 @@ class PrintBarAgent:
             logger.info(f"Job {order_id} completed successfully!")
 
         except Exception as e:
-            logger.error(f"Job {order_id} failed: {e}")
-            self.report_failure(order_id, pages_printed=0, reason=str(e))
+            logger.error(f"Job {order_id} failed during execution: {e}")
+            # Report actual verified pages printed prior to failure, not hardcoded zero!
+            self.report_failure(order_id, pages_printed=total_pages_printed, reason=str(e))
             mark_job_failed(order_id)
         finally:
             # Step 5: Privacy Shredding — securely delete customer files immediately
             for fp in downloaded_files:
                 self.secure_delete_file(fp)
 
-    def trigger_fallback(self, order_id: str, pages_printed: int, reason: str) -> bool:
+    def trigger_fallback(self, order_id: str, pages_printed: int, reason: str, previous_cups_job_id: str = None) -> bool:
         """Call cloud API to transition job to fallback_pending on Canon"""
         url = f"{CLOUD_API_URL}/api/device/jobs/{order_id}?action=fallback"
         headers = get_auth_headers()
         headers["Content-Type"] = "application/json"
+        payload = {"pagesPrinted": pages_printed, "reason": reason}
+        if previous_cups_job_id:
+            payload["previousCupsJobId"] = previous_cups_job_id
         try:
-            res = requests.post(url, json={"pagesPrinted": pages_printed, "reason": reason}, headers=headers, timeout=10)
+            res = requests.post(url, json=payload, headers=headers, timeout=10)
             return res.status_code == 200
         except Exception as e:
             logger.error(f"Fallback request error: {e}")

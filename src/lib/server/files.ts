@@ -45,18 +45,24 @@ export async function readMeta(id: string): Promise<FileMeta | null> {
   }
 }
 
-export async function deleteStoredFiles(ids: string[]) {
+export async function deleteStoredFiles(ids: string[]): Promise<boolean> {
+  let allDeleted = true;
   try {
     const files = await readdir(DIR);
     for (const id of ids) {
       if (!UUID.test(id)) continue;
       for (const f of files.filter((f) => f.startsWith(id + "."))) {
-        await unlink(path.join(DIR, f)).catch(() => {});
+        try {
+          await unlink(path.join(DIR, f));
+        } catch {
+          allDeleted = false;
+        }
       }
     }
   } catch {
     /* directory may not exist yet */
   }
+  return allDeleted;
 }
 
 export async function storedFileExists(id: string) {
@@ -72,18 +78,84 @@ export async function storedFileExists(id: string) {
   }
 }
 
+/**
+ * Verified cleanup of all documents associated with an order.
+ * Updates order record with cleanupStatus ('CLEANED' or 'CLEANUP_FAILED') and timestamp.
+ */
+export async function cleanupOrderFiles(orderId: string): Promise<{ success: boolean; error?: string }> {
+  const { db } = await import("@/db");
+  const { orders } = await import("@/db/schema");
+  const { eq } = await import("drizzle-orm");
+
+  try {
+    const [order] = await db.select().from(orders).where(eq(orders.orderId, orderId));
+    if (!order) return { success: false, error: "Order not found" };
+
+    const docs = (order.docs as { id: string }[]) || [];
+    const docIds = docs.map((d) => d.id).filter(Boolean);
+
+    if (docIds.length === 0) {
+      await db
+        .update(orders)
+        .set({ filesDeleted: true, filesDeletedAt: new Date(), cleanupStatus: "CLEANED", updatedAt: new Date() })
+        .where(eq(orders.orderId, orderId));
+      return { success: true };
+    }
+
+    await deleteStoredFiles(docIds);
+
+    // Verify deletion
+    const remaining = [];
+    for (const id of docIds) {
+      if (await storedFileExists(id)) remaining.push(id);
+    }
+
+    if (remaining.length > 0) {
+      await db
+        .update(orders)
+        .set({
+          cleanupStatus: "CLEANUP_FAILED",
+          cleanupError: `Files still exist after unlink: ${remaining.join(", ")}`,
+          updatedAt: new Date(),
+        })
+        .where(eq(orders.orderId, orderId));
+      return { success: false, error: "Files could not be completely removed." };
+    }
+
+    await db
+      .update(orders)
+      .set({
+        filesDeleted: true,
+        filesDeletedAt: new Date(),
+        cleanupStatus: "CLEANED",
+        cleanupError: null,
+        updatedAt: new Date(),
+      })
+      .where(eq(orders.orderId, orderId));
+
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: (err as Error).message };
+  }
+}
+
 /** Sweep leftovers older than 24h (best effort). */
-export async function sweepOldFiles() {
+export async function sweepOldFiles(): Promise<{ swept: number }> {
+  let count = 0;
   try {
     const files = await readdir(DIR);
     for (const f of files) {
       const p = path.join(DIR, f);
       const s = await stat(p);
-      if (Date.now() - s.mtimeMs > 24 * 3600 * 1000) await unlink(p).catch(() => {});
+      if (Date.now() - s.mtimeMs > 24 * 3600 * 1000) {
+        await unlink(p).catch(() => {});
+        count++;
+      }
     }
   } catch {
     /* ignore */
   }
+  return { swept: count };
 }
 
 export function countPdfPages(buf: Buffer): number {

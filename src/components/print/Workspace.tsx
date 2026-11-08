@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Icon, Logo } from "@/components/ui/Icon";
 import { ALLOWED_EXT, rupees } from "@/lib/config";
-import { parsePageRange } from "@/lib/pricing";
+import { calculatePrintQuote, parsePageRange } from "@/lib/pricing";
 import { DocPreview } from "./DocPreview";
 import { PaymentSheet } from "./PaymentSheet";
 import { SettingsPanel } from "./Settings";
@@ -20,7 +20,14 @@ export function Workspace({ cfg }: { cfg: Cfg }) {
   const [page, setPage] = useState(1);
   const [zoom, setZoom] = useState(1);
   const [drag, setDrag] = useState(false);
-  const [settings, setSettings] = useState<Settings>({ colorMode: "bw", copies: 1, paperSize: cfg.hardware.paperSizes[0], sides: "single", orientation: "portrait" });
+  const [settings, setSettings] = useState<Settings>({
+    colorMode: "bw",
+    copies: 1,
+    paperSize: cfg.hardware.paperSizes[0] ?? "A4",
+    sides: "single",
+    orientation: "portrait",
+    pagesPerSheet: 1,
+  });
   const [order, setOrder] = useState<{ orderId: string; token: string; amount: number } | null>(null);
   const [creating, setCreating] = useState(false);
   const [notice, setNotice] = useState("");
@@ -79,6 +86,15 @@ export function Workspace({ cfg }: { cfg: Cfg }) {
 
   const addFiles = useCallback(
     (files: FileList | File[]) => {
+      if (cfg.paper?.maintenanceMode) {
+        setNotice("Kiosk is currently undergoing maintenance. Document uploads are temporarily paused.");
+        return;
+      }
+      if (cfg.paper?.outOfPaper || cfg.paper?.paperReady === false) {
+        setNotice("Kiosk is out of paper. Please wait for an operator to refill paper before uploading.");
+        return;
+      }
+
       const arr = Array.from(files);
       let slots = cfg.hardware.maxFiles - docs.length;
       const created: UDoc[] = [];
@@ -125,23 +141,49 @@ export function Workspace({ cfg }: { cfg: Cfg }) {
     }
   }
 
-  /* ---------- Quote ---------- */
-  const rate = settings.colorMode === "color" ? cfg.pricing.color : cfg.pricing.bw;
-  const lines = ready.map((d) => {
-    const r = d.useRange ? parsePageRange(d.range, d.pages) : { count: d.pages, error: undefined as string | undefined };
-    return { doc: d, count: r.count, error: r.error };
-  });
-  const pagesPerCopy = lines.reduce((s, l) => s + l.count, 0);
-  const totalPages = pagesPerCopy * settings.copies;
-  const amount = totalPages * rate;
-  const hasRangeError = lines.some((l) => l.error);
-  const canContinue = ready.length > 0 && !uploading && !hasRangeError && pagesPerCopy > 0;
+  /* ---------- Authoritative Quote Calculation ---------- */
+  const quote = useMemo(
+    () =>
+      calculatePrintQuote(
+        ready.map((d) => ({
+          name:  d.name,
+          pages: d.pages,
+          range: d.useRange ? d.range : null,
+        })),
+        {
+          copies:        settings.copies,
+          colorMode:     settings.colorMode,
+          sides:         settings.sides,
+          pagesPerSheet: settings.pagesPerSheet,
+          config: {
+            bwPerPage:      cfg.pricing.bw,
+            colorPerPage:   cfg.pricing.color,
+            billingBasis:   cfg.pricing.billingBasis,
+            minOrderAmount: cfg.pricing.minOrderAmount,
+          },
+        }
+      ),
+    [ready, settings, cfg.pricing]
+  );
+
+  const lines = quote.lines;
+  const pagesPerCopy = quote.pagesPerCopy;
+  const totalPages = quote.totalLogicalPages;
+  const physicalSheets = quote.physicalSheets;
+  const rate = quote.rate;
+  const amount = quote.amount;
+  const hasRangeError = !!quote.error;
+  const isMaintenance = Boolean(cfg.paper?.maintenanceMode);
+  const isOutOfPaper = Boolean(cfg.paper?.outOfPaper || cfg.paper?.paperReady === false);
+  const isBlocked = isMaintenance || isOutOfPaper;
+  const blockedText = isMaintenance ? "Maintenance Mode" : isOutOfPaper ? "Out of Paper" : undefined;
+  const canContinue = ready.length > 0 && !uploading && !hasRangeError && pagesPerCopy > 0 && !isBlocked;
 
   const signature = JSON.stringify([ready.map((d) => [d.serverId, d.useRange ? d.range : ""]), settings]);
   useEffect(() => setOrder(null), [signature]);
 
   async function proceed() {
-    if (!canContinue) return;
+    if (!canContinue || isBlocked) return;
     setNotice("");
     if (order) return setPayOpen(true);
     setCreating(true);
@@ -194,6 +236,31 @@ export function Workspace({ cfg }: { cfg: Cfg }) {
 
       <main className="mx-auto max-w-6xl px-4 pb-36 pt-6 lg:grid lg:grid-cols-[minmax(0,1fr)_380px] lg:items-start lg:gap-8 lg:px-8 lg:pb-16 lg:pt-10">
         <div className="space-y-5">
+          {isBlocked && (
+            <div
+              className={`flex items-start gap-3.5 rounded-2xl border p-4.5 text-sm shadow-sm ${
+                isMaintenance
+                  ? "border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-900/40 dark:bg-amber-950/30 dark:text-amber-200"
+                  : "border-red-300 bg-red-50 text-red-900 dark:border-red-900/40 dark:bg-red-950/30 dark:text-red-200"
+              }`}
+              role="alert"
+            >
+              <span className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-xl bg-white/80 shadow-sm text-base">
+                {isMaintenance ? "🛠️" : "⚠️"}
+              </span>
+              <div>
+                <p className="font-semibold text-[15px]">
+                  {isMaintenance ? "Kiosk in Maintenance Mode" : "Kiosk Out of Paper"}
+                </p>
+                <p className="mt-0.5 leading-relaxed opacity-90">
+                  {isMaintenance
+                    ? "Printing operations are temporarily suspended for servicing. Please check back shortly."
+                    : "Uploads and payments are temporarily paused while an operator refills the paper trays."}
+                </p>
+              </div>
+            </div>
+          )}
+
           <div>
             <h1 className="text-3xl font-semibold tracking-tight md:text-4xl">
               {ready.length ? "Review and print" : <>Upload your <span className="font-display italic font-normal">document.</span></>}
@@ -207,6 +274,7 @@ export function Workspace({ cfg }: { cfg: Cfg }) {
               ref={input}
               type="file"
               multiple
+              disabled={isBlocked}
               accept=".pdf,.doc,.docx,.jpg,.jpeg,.png,application/pdf,image/jpeg,image/png"
               className="sr-only"
               onChange={(e) => {
@@ -217,41 +285,59 @@ export function Workspace({ cfg }: { cfg: Cfg }) {
             {docs.length === 0 ? (
               <div
                 onDragOver={(e) => {
+                  if (isBlocked) return;
                   e.preventDefault();
                   setDrag(true);
                 }}
                 onDragLeave={() => setDrag(false)}
                 onDrop={(e) => {
+                  if (isBlocked) return;
                   e.preventDefault();
                   setDrag(false);
                   addFiles(e.dataTransfer.files);
                 }}
                 className={`flex flex-col items-center rounded-[28px] border-2 border-dashed px-6 py-14 text-center transition ${
-                  drag ? "border-signal bg-signal-soft" : "border-ink/20 bg-white"
+                  isBlocked
+                    ? "border-amber-300/40 bg-amber-50/20 opacity-80"
+                    : drag
+                    ? "border-signal bg-signal-soft"
+                    : "border-ink/20 bg-white"
                 }`}
               >
-                <span className="flex h-16 w-16 items-center justify-center rounded-2xl bg-ink text-paper">
-                  <Icon name="upload" size={28} />
+                <span className={`flex h-16 w-16 items-center justify-center rounded-2xl ${isBlocked ? "bg-amber-100 text-amber-800" : "bg-ink text-paper"}`}>
+                  <Icon name={isBlocked ? "alert" : "upload"} size={28} />
                 </span>
-                <p className="mt-5 text-xl font-semibold">{drag ? "Drop to upload" : "Choose a file to print"}</p>
-                <p className="mt-1 hidden text-[15px] text-mute md:block">Drag and drop here, or browse your computer</p>
-                <p className="mt-1 text-[15px] text-mute md:hidden">From your phone, Files or Google Drive</p>
+                <p className="mt-5 text-xl font-semibold">
+                  {isMaintenance ? "Kiosk in maintenance mode" : isOutOfPaper ? "Kiosk is out of paper" : drag ? "Drop to upload" : "Choose a file to print"}
+                </p>
+                <p className="mt-1 text-[15px] text-mute">
+                  {isBlocked
+                    ? "Uploads and printing are paused until serviced."
+                    : "Drag and drop here, or browse your files (up to 25 MB)"}
+                </p>
                 <button
                   type="button"
-                  onClick={() => input.current?.click()}
-                  className="mt-6 inline-flex h-14 items-center rounded-full bg-ink px-8 text-[16px] font-semibold text-paper transition hover:bg-ink-2 active:scale-[0.98]"
+                  disabled={isBlocked}
+                  onClick={() => !isBlocked && input.current?.click()}
+                  className={`mt-6 inline-flex h-14 items-center rounded-full px-8 text-[16px] font-semibold transition ${
+                    isBlocked
+                      ? "bg-line text-mute cursor-not-allowed"
+                      : "bg-ink text-paper hover:bg-ink-2 active:scale-[0.98]"
+                  }`}
                 >
-                  Select files
+                  {isBlocked ? (isMaintenance ? "Maintenance Active" : "Paper Refill Required") : "Select files"}
                 </button>
               </div>
             ) : (
               <div
                 onDragOver={(e) => {
+                  if (isBlocked) return;
                   e.preventDefault();
                   setDrag(true);
                 }}
                 onDragLeave={() => setDrag(false)}
                 onDrop={(e) => {
+                  if (isBlocked) return;
                   e.preventDefault();
                   setDrag(false);
                   addFiles(e.dataTransfer.files);
@@ -368,17 +454,19 @@ export function Workspace({ cfg }: { cfg: Cfg }) {
                     <dt className="text-[12.5px] font-semibold uppercase tracking-wider text-mute">Documents · {ready.length}</dt>
                     <dd className="mt-1.5 space-y-1">
                       {lines.map((l) => (
-                        <div key={l.doc.localId} className="flex justify-between gap-3">
-                          <span className="truncate">{l.doc.name}</span>
-                          <span className={`shrink-0 tabular-nums ${l.error ? "text-bad" : "text-mute"}`}>{l.error ? "check range" : `${l.count} pg`}</span>
+                        <div key={l.name} className="flex justify-between gap-3">
+                          <span className="truncate">{l.name}</span>
+                          <span className="shrink-0 tabular-nums text-mute">{l.selectedPages} pg</span>
                         </div>
                       ))}
                     </dd>
                   </div>
-                  <Row k="Total pages" v={`${pagesPerCopy}${settings.copies > 1 ? ` × ${settings.copies} copies = ${totalPages}` : ""}`} />
-                  <Row k="Copies" v={String(settings.copies)} />
+                  <Row k="Total pages" v={`${pagesPerCopy}${settings.copies > 1 ? ` × ${settings.copies} = ${totalPages}` : ""}`} />
+                  <Row k="Pages per sheet" v={settings.pagesPerSheet === 1 ? "1-up (Standard)" : `${settings.pagesPerSheet}-up (${settings.pagesPerSheet} on 1)`} />
+                  <Row k="Printing sides" v={settings.sides === "single" ? "Single-sided" : "Double-sided"} />
+                  <Row k="Physical sheets" v={`${physicalSheets} sheet${physicalSheets === 1 ? "" : "s"}`} />
                   <Row k="Colour mode" v={settings.colorMode === "bw" ? "Black & White" : "Colour"} />
-                  <Row k="Settings" v={`${settings.paperSize} · ${settings.sides === "single" ? "Single" : "Double"}-sided · ${settings.orientation === "portrait" ? "Portrait" : "Landscape"}`} />
+                  <Row k="Settings" v={`${settings.paperSize} · ${settings.orientation === "portrait" ? "Portrait" : "Landscape"}`} />
                 </dl>
               )}
             </div>
@@ -387,7 +475,7 @@ export function Workspace({ cfg }: { cfg: Cfg }) {
                 <div className="border-t border-dashed border-line bg-paper-2/50 px-5 py-4 md:px-6">
                   <div className="flex items-center justify-between text-[14px] text-mute">
                     <span>
-                      {totalPages} page{totalPages === 1 ? "" : "s"} × {rupees(rate)}
+                      {physicalSheets} sheet{physicalSheets === 1 ? "" : "s"} × {rupees(rate)}
                     </span>
                     <span className="tabular-nums">{rupees(amount)}</span>
                   </div>
@@ -399,7 +487,7 @@ export function Workspace({ cfg }: { cfg: Cfg }) {
                   </div>
                 </div>
                 <div className="hidden p-5 pt-4 lg:block md:p-6 md:pt-4">
-                  <PayButton onClick={proceed} disabled={!canContinue || creating} loading={creating} uploading={uploading} />
+                  <PayButton onClick={proceed} disabled={!canContinue || creating || isBlocked} loading={creating} uploading={uploading} blockedText={blockedText} />
                   {notice && <p className="mt-3 text-center text-[13px] text-bad" role="alert">{notice}</p>}
                 </div>
               </>
@@ -421,7 +509,7 @@ export function Workspace({ cfg }: { cfg: Cfg }) {
               <p className="text-[12px] text-mute">Total payable</p>
               <p className="text-2xl font-semibold tabular-nums leading-tight">{rupees(amount)}</p>
             </div>
-            <PayButton onClick={proceed} disabled={!canContinue || creating} loading={creating} uploading={uploading} compact />
+            <PayButton onClick={proceed} disabled={!canContinue || creating || isBlocked} loading={creating} uploading={uploading} compact blockedText={blockedText} />
           </div>
         </div>
       )}
@@ -446,7 +534,21 @@ function Row({ k, v }: { k: string; v: string }) {
   );
 }
 
-function PayButton({ onClick, disabled, loading, uploading, compact }: { onClick: () => void; disabled: boolean; loading: boolean; uploading: boolean; compact?: boolean }) {
+function PayButton({
+  onClick,
+  disabled,
+  loading,
+  uploading,
+  compact,
+  blockedText,
+}: {
+  onClick: () => void;
+  disabled: boolean;
+  loading: boolean;
+  uploading: boolean;
+  compact?: boolean;
+  blockedText?: string;
+}) {
   return (
     <button
       type="button"
@@ -456,9 +558,11 @@ function PayButton({ onClick, disabled, loading, uploading, compact }: { onClick
     >
       {loading ? (
         <span className="h-5 w-5 animate-spin-slow rounded-full border-2 border-paper/30 border-t-paper" />
+      ) : blockedText ? (
+        <span>{blockedText}</span>
       ) : (
         <>
-          {uploading ? "Uploading…" : compact ? "Continue to Payment" : "Continue to Payment"}
+          {uploading ? "Uploading…" : "Continue to Payment"}
           {!uploading && <Icon name="arrow" size={18} />}
         </>
       )}
