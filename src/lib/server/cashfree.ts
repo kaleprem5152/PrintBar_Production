@@ -299,16 +299,17 @@ export function verifyCashfreeWebhookSignature(
   signature: string
 ): boolean {
   const { clientSecret } = getCashfreeConfig();
+  const secretKey = process.env.CASHFREE_WEBHOOK_SECRET?.trim() || clientSecret;
 
-  if (!clientSecret) {
-    console.error("[cashfree] CASHFREE_CLIENT_SECRET not set — cannot verify webhook");
+  if (!secretKey) {
+    console.error("[cashfree] Webhook secret / client secret not set — cannot verify webhook");
     return false;
   }
   if (!timestamp || !signature) return false;
 
   try {
     const message  = timestamp + rawBody;
-    const expected = createHmac("sha256", clientSecret)
+    const expected = createHmac("sha256", secretKey)
       .update(message)
       .digest("base64");
 
