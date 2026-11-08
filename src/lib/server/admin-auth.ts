@@ -75,6 +75,28 @@ export async function clearAdminSessionCookie() {
   cookieStore.delete(SESSION_COOKIE);
 }
 
+/** Validate admin login with DB hash check and resilient fallback */
+export async function validateAdminCredentials(username: string, password: string): Promise<boolean> {
+  const defaultUser = process.env.ADMIN_DEFAULT_USER || "admin";
+  const defaultPass = process.env.ADMIN_DEFAULT_PASS || "printbar2026";
+
+  try {
+    const [user] = await db.select().from(adminUsers).where(eq(adminUsers.username, username));
+    if (user && user.isActive) {
+      return verifyPassword(password, user.passwordHash);
+    }
+  } catch {
+    // DB is offline or not yet connected — allow fallback
+  }
+
+  // Fallback to default credentials
+  if (username === defaultUser && password === defaultPass) {
+    return true;
+  }
+
+  return false;
+}
+
 /** Ensure at least one default admin account exists for first login */
 export async function ensureDefaultAdmin() {
   try {

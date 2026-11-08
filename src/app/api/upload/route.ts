@@ -6,12 +6,29 @@ export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
 const MIME: Record<string, string[]> = {
-  pdf: ["application/pdf"],
-  doc: ["application/msword", "application/octet-stream"],
-  docx: ["application/vnd.openxmlformats-officedocument.wordprocessingml.document", "application/octet-stream"],
-  jpg: ["image/jpeg"],
-  jpeg: ["image/jpeg"],
-  png: ["image/png"],
+  pdf: [
+    "application/pdf",
+    "application/x-pdf",
+    "application/acrobat",
+    "applications/vnd.pdf",
+    "text/pdf",
+    "application/octet-stream",
+  ],
+  doc: [
+    "application/msword",
+    "application/doc",
+    "application/x-msword",
+    "application/octet-stream",
+  ],
+  docx: [
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/zip",
+    "application/x-zip-compressed",
+    "application/octet-stream",
+  ],
+  jpg: ["image/jpeg", "image/pjpeg", "image/jpg", "application/octet-stream"],
+  jpeg: ["image/jpeg", "image/pjpeg", "image/jpg", "application/octet-stream"],
+  png: ["image/png", "image/x-png", "application/octet-stream"],
 };
 
 export async function POST(req: Request) {
@@ -32,8 +49,11 @@ export async function POST(req: Request) {
   if (file.size > HARDWARE.maxUploadBytes) {
     return Response.json({ error: "File is larger than 25 MB." }, { status: 413 });
   }
-  if (file.type && !MIME[ext].includes(file.type)) {
-    return Response.json({ error: "File content does not match its extension." }, { status: 415 });
+  if (file.type && MIME[ext] && !MIME[ext].includes(file.type)) {
+    const isImage = (ext === "jpg" || ext === "jpeg" || ext === "png") && file.type.startsWith("image/");
+    if (!isImage && file.type !== "application/octet-stream") {
+      return Response.json({ error: "File content does not match its extension." }, { status: 415 });
+    }
   }
 
   const buf = Buffer.from(await file.arrayBuffer());

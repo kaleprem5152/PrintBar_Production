@@ -165,7 +165,7 @@ export function DocPreview({
         </button>
       </div>
 
-      <div ref={box} className="relative h-[440px] overflow-auto border-y border-line bg-[#e9e5db] md:h-[560px]">
+      <div ref={box} className="relative h-[340px] sm:h-[440px] md:h-[560px] overflow-auto border-y border-line bg-[#e9e5db]">
         <div className="flex min-h-full min-w-full items-start justify-center p-4" style={{ width: "max-content" }}>
           {state === "loading" && (
             <div className="mt-24 flex flex-col items-center gap-3 text-mute">

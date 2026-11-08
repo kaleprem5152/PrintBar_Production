@@ -4,7 +4,7 @@ import { adminUsers } from "@/db/schema";
 import {
   ensureDefaultAdmin,
   setAdminSessionCookie,
-  verifyPassword,
+  validateAdminCredentials,
 } from "@/lib/server/admin-auth";
 import { logAuditEvent } from "@/lib/server/orders";
 
@@ -22,26 +22,26 @@ export async function POST(req: Request) {
     return Response.json({ error: "Username and password are required." }, { status: 400 });
   }
 
-  const [user] = await db.select().from(adminUsers).where(eq(adminUsers.username, username));
-  if (!user || !user.isActive) {
-    return Response.json({ error: "Invalid credentials." }, { status: 401 });
-  }
-
-  const valid = verifyPassword(password, user.passwordHash);
+  const valid = await validateAdminCredentials(username, password);
   if (!valid) {
     return Response.json({ error: "Invalid credentials." }, { status: 401 });
   }
 
-  await setAdminSessionCookie(user.username);
-  await db
-    .update(adminUsers)
-    .set({ lastLoginAt: new Date() })
-    .where(eq(adminUsers.id, user.id));
+  await setAdminSessionCookie(username);
+
+  try {
+    await db
+      .update(adminUsers)
+      .set({ lastLoginAt: new Date() })
+      .where(eq(adminUsers.username, username));
+  } catch {
+    // Ignore in fallback mode
+  }
 
   await logAuditEvent({
     eventType: "admin_login",
-    actorId:   user.username,
+    actorId:   username,
   });
 
-  return Response.json({ ok: true, username: user.username });
+  return Response.json({ ok: true, username });
 }

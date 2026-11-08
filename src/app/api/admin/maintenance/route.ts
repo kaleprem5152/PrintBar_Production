@@ -1,8 +1,5 @@
-import { eq } from "drizzle-orm";
-import { db } from "@/db";
-import { devices } from "@/db/schema";
 import { getAuthenticatedAdmin } from "@/lib/server/admin-auth";
-import { logAuditEvent } from "@/lib/server/orders";
+import { logAuditEvent, setDeviceMaintenance } from "@/lib/server/orders";
 
 export const dynamic = "force-dynamic";
 
@@ -21,10 +18,7 @@ export async function POST(req: Request) {
     return Response.json({ error: "deviceId and maintenanceMode are required." }, { status: 400 });
   }
 
-  await db
-    .update(devices)
-    .set({ maintenanceMode, updatedAt: new Date() })
-    .where(eq(devices.id, deviceId));
+  await setDeviceMaintenance(deviceId, maintenanceMode);
 
   await logAuditEvent({
     eventType: "admin_action",

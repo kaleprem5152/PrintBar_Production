@@ -104,11 +104,11 @@ export function OrderView({ orderId, token, isNew, embed }: { orderId: string; t
               <section className="relative overflow-hidden rounded-[28px] bg-ink p-6 text-paper md:p-8" aria-label="Collection PIN">
                 <div className="pointer-events-none absolute -right-20 -top-20 h-64 w-64 rounded-full bg-signal/25 blur-3xl" />
                 <p className="relative text-[12.5px] font-semibold uppercase tracking-[0.16em] text-paper/60">Collection PIN</p>
-                <div className="relative mt-4 flex gap-2.5 md:gap-3.5" aria-live="polite" aria-label={`Your collection PIN is ${o.pin.split("").join(" ")}`}>
+                <div className="relative mt-4 flex gap-2 sm:gap-2.5 md:gap-3.5" aria-live="polite" aria-label={`Your collection PIN is ${o.pin.split("").join(" ")}`}>
                   {o.pin.split("").map((d, i) => (
                     <div
                       key={i}
-                      className={`flex h-[84px] flex-1 items-center justify-center rounded-2xl border text-[52px] font-semibold tabular-nums transition-all duration-300 md:h-[104px] md:text-[64px] ${
+                      className={`flex h-[72px] sm:h-[84px] md:h-[104px] flex-1 items-center justify-center rounded-2xl border text-[36px] sm:text-[52px] md:text-[64px] font-semibold tabular-nums transition-all duration-300 ${
                         i < revealed ? "border-paper/25 bg-paper text-ink" : "border-paper/15 bg-paper/10 text-paper/40"
                       }`}
                       style={{ transform: i < revealed ? "none" : "scale(0.94)" }}
@@ -118,13 +118,13 @@ export function OrderView({ orderId, token, isNew, embed }: { orderId: string; t
                   ))}
                 </div>
                 <div className="relative mt-5 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                  <p className="max-w-sm text-[13.5px] leading-relaxed text-paper/65">
-                    Enter this PIN on a PrintBar kiosk to collect your prints. It&apos;s a collection code, not a login. Valid for 24 hours.
+                  <p className="max-w-sm text-[13px] sm:text-[13.5px] leading-relaxed text-paper/65">
+                    Enter this PIN on a PrintBar kiosk to collect your prints. Valid for 24 hours.
                   </p>
                   <button
                     type="button"
                     onClick={copy}
-                    className="inline-flex h-12 shrink-0 items-center justify-center gap-2 rounded-full bg-paper px-6 text-[15px] font-semibold text-ink transition active:scale-[0.97]"
+                    className="inline-flex h-12 w-full sm:w-auto shrink-0 items-center justify-center gap-2 rounded-full bg-paper px-6 text-[15px] font-semibold text-ink transition active:scale-[0.97]"
                   >
                     <Icon name={copied ? "check" : "copy"} size={17} />
                     {copied ? "Copied" : "Copy PIN"}

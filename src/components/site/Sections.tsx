@@ -21,7 +21,7 @@ export function PricingSection() {
             <div>
               <h3 className="text-sm font-semibold uppercase tracking-[0.16em] text-paper/60">Black &amp; White</h3>
               <p className="mt-6 flex items-baseline gap-2">
-                <span className="text-[88px] font-semibold leading-none tracking-tighter md:text-[112px]">₹{PRICING.bw}</span>
+                <span className="text-[64px] sm:text-[88px] md:text-[112px] font-semibold leading-none tracking-tighter">₹{PRICING.bw}</span>
                 <span className="text-lg text-paper/60">per page</span>
               </p>
             </div>
@@ -36,7 +36,7 @@ export function PricingSection() {
             <div>
               <h3 className="text-sm font-semibold uppercase tracking-[0.16em] text-mute">Colour</h3>
               <p className="mt-6 flex items-baseline gap-2">
-                <span className="text-[88px] font-semibold leading-none tracking-tighter md:text-[112px]">₹{PRICING.color}</span>
+                <span className="text-[64px] sm:text-[88px] md:text-[112px] font-semibold leading-none tracking-tighter">₹{PRICING.color}</span>
                 <span className="text-lg text-mute">per page</span>
               </p>
             </div>

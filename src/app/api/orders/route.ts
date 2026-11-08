@@ -11,7 +11,7 @@ import { db } from "@/db";
 import { orders, type OrderDoc } from "@/db/schema";
 import { HARDWARE, PRICING } from "@/lib/config";
 import { buildQuote } from "@/lib/pricing";
-import { newOrderRef, logAuditEvent } from "@/lib/server/orders";
+import { createOrderRecord, logAuditEvent } from "@/lib/server/orders";
 import { readMeta, type FileMeta } from "@/lib/server/files";
 
 export const dynamic = "force-dynamic";
@@ -92,28 +92,21 @@ export async function POST(req: Request) {
 
   const token = randomBytes(16).toString("hex");
 
-  // Insert with a temporary order ID, then update with the human-readable ref
-  const [row] = await db
-    .insert(orders)
-    .values({
-      orderId:      `TMP-${randomBytes(6).toString("hex")}`,
-      token,
-      status:       "created",
-      docs,
-      pagesPerCopy: quote.pagesPerCopy,
-      copies,
-      colorMode,
-      paperSize,
-      sides,
-      orientation,
-      amount:       quote.amount,
-      rateApplied:  quote.rate,
-      pagesToPrint: quote.totalPages,
-    })
-    .returning();
+  const row = await createOrderRecord({
+    token,
+    docs,
+    pagesPerCopy: quote.pagesPerCopy,
+    copies,
+    colorMode,
+    paperSize,
+    sides,
+    orientation,
+    amount:       quote.amount,
+    rateApplied:  quote.rate,
+    pagesToPrint: quote.totalPages,
+  });
 
-  const orderId = newOrderRef(row.id);
-  await db.update(orders).set({ orderId, updatedAt: new Date() }).where(eq(orders.id, row.id));
+  const orderId = row.orderId;
 
   await logAuditEvent({
     eventType: "order_created",

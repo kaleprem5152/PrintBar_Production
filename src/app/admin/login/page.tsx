@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { Logo } from "@/components/ui/Icon";
+import { LogoMark } from "@/components/ui/Icon";
 
 export default function AdminLoginPage() {
   const router = useRouter();
@@ -40,8 +40,8 @@ export default function AdminLoginPage() {
     <div className="flex min-h-screen items-center justify-center bg-[#0d0f12] px-4 text-[#ededed]">
       <div className="w-full max-w-md rounded-3xl border border-white/10 bg-[#15191e] p-8 shadow-2xl backdrop-blur-xl">
         <div className="flex flex-col items-center text-center">
-          <div className="mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-white/5 border border-white/10">
-            <Logo />
+          <div className="mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-white/5 border border-white/10 shadow-inner">
+            <LogoMark size={32} />
           </div>
           <h1 className="text-2xl font-bold tracking-tight">PrintBar Operations</h1>
           <p className="mt-1 text-sm text-[#8a929e]">Single-Machine Telemetry & Management Console</p>

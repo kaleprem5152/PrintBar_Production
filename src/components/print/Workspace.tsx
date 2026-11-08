@@ -150,7 +150,13 @@ export function Workspace({ cfg }: { cfg: Cfg }) {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          docs: ready.map((d) => ({ id: d.serverId, range: d.useRange && d.range.trim() ? d.range.trim() : null })),
+          docs: ready.map((d) => ({
+            id: d.serverId,
+            name: d.name,
+            size: d.size,
+            pages: d.pages,
+            range: d.useRange && d.range.trim() ? d.range.trim() : null,
+          })),
           ...settings,
         }),
       });

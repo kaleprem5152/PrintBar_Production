@@ -2,17 +2,12 @@
  * POST /api/payments/create-order
  *
  * Creates a Cashfree payment order for the given PrintBar order.
- * Called by the frontend after the user clicks "Continue to Payment".
- *
- * Returns the Cashfree payment session ID needed for the JS SDK checkout.
- * The cfOrderId is stored in our database; never rely on client-supplied values.
+ * If Cashfree credentials are not yet configured (e.g. local dev / preview),
+ * it returns a simulation session so the order can still be completed and tested.
  */
 import "server-only";
-import { eq } from "drizzle-orm";
-import { db } from "@/db";
-import { orders, paymentTransactions } from "@/db/schema";
-import { createCashfreeOrder, isCashfreeConfigured } from "@/lib/server/cashfree";
-import { logAuditEvent } from "@/lib/server/orders";
+import { findByToken, updateOrderPaymentState, logAuditEvent } from "@/lib/server/orders";
+import { createCashfreeOrder, isCashfreeConfigured, cashfreeEnv } from "@/lib/server/cashfree";
 
 export const dynamic = "force-dynamic";
 
@@ -26,63 +21,61 @@ export async function POST(req: Request) {
     return Response.json({ error: "orderId and token are required." }, { status: 400 });
   }
 
-  // Verify the order exists and the token matches
-  const [order] = await db
-    .select()
-    .from(orders)
-    .where(eq(orders.orderId, orderId));
-
-  if (!order || order.token !== token) {
+  const order = await findByToken(orderId, token);
+  if (!order) {
     return Response.json({ error: "Order not found." }, { status: 404 });
   }
 
-  // If already has an existing Cashfree order in pending_payment state, return it
-  if (order.cashfreeOrderId && order.status === "pending_payment") {
+  // Already paid
+  if (order.status === "paid") {
     return Response.json({
-      cfOrderId: order.cashfreeOrderId,
-      orderId:   order.orderId,
-      amount:    order.amount,
+      orderId: order.orderId,
+      paid: true,
+      pin: order.pin,
+      amount: order.amount,
     });
   }
 
-  // Only allow payment creation for orders awaiting payment
-  if (order.status !== "created" && order.status !== "pending_payment") {
-    return Response.json({ error: "This order is not awaiting payment." }, { status: 409 });
-  }
+  // Check if Cashfree credentials are configured in environment
+  const configured = isCashfreeConfigured();
 
-  if (!isCashfreeConfigured()) {
-    return Response.json(
-      { error: "Payment gateway not configured. Contact support." },
-      { status: 503 }
-    );
+  if (!configured) {
+    // Sandbox / Test simulation mode
+    const simCfOrderId = `sim_${order.orderId}`;
+    await updateOrderPaymentState({
+      orderId: order.orderId,
+      cashfreeOrderId: simCfOrderId,
+      status: "pending_payment",
+    });
+
+    await logAuditEvent({
+      eventType: "payment_initiated",
+      orderId:   order.orderId,
+      details:   { cfOrderId: simCfOrderId, amount: order.amount, mode: "simulation" },
+    });
+
+    return Response.json({
+      cfOrderId:    simCfOrderId,
+      sessionId:    `sim_sess_${order.token}`,
+      orderId:      order.orderId,
+      amount:       order.amount,
+      isConfigured: false,
+      isSimulation: true,
+      env:          "sandbox",
+    });
   }
 
   try {
-    // Create Cashfree order
     const cfOrder = await createCashfreeOrder({
       internalOrderId: order.orderId,
       amount:          order.amount,
+      token:           order.token,
     });
 
-    // Store Cashfree order ID and transition status
-    await db.transaction(async (tx) => {
-      await tx
-        .update(orders)
-        .set({
-          cashfreeOrderId: cfOrder.cfOrderId,
-          status:          "pending_payment",
-          updatedAt:       new Date(),
-        })
-        .where(eq(orders.id, order.id));
-
-      // Create a pending payment transaction record
-      await tx.insert(paymentTransactions).values({
-        orderId:         order.orderId,
-        cashfreeOrderId: cfOrder.cfOrderId,
-        status:          "pending",
-        amount:          order.amount,
-        currency:        "INR",
-      });
+    await updateOrderPaymentState({
+      orderId:         order.orderId,
+      cashfreeOrderId: cfOrder.cfOrderId,
+      status:          "pending_payment",
     });
 
     await logAuditEvent({
@@ -92,15 +85,19 @@ export async function POST(req: Request) {
     });
 
     return Response.json({
-      cfOrderId:  cfOrder.cfOrderId,
-      sessionId:  cfOrder.sessionId,
-      orderId:    order.orderId,
-      amount:     order.amount,
+      cfOrderId:    cfOrder.cfOrderId,
+      sessionId:    cfOrder.sessionId,
+      checkoutUrl:  cfOrder.checkoutUrl,
+      orderId:      order.orderId,
+      amount:       order.amount,
+      isConfigured: true,
+      isSimulation: false,
+      env:          cashfreeEnv(),
     });
   } catch (err) {
     console.error("[create-order] Cashfree order creation failed:", err);
     return Response.json(
-      { error: "Payment gateway temporarily unavailable. Please try again." },
+      { error: (err as Error).message || "Payment gateway temporarily unavailable. Please try again." },
       { status: 502 }
     );
   }

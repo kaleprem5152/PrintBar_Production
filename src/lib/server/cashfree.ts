@@ -17,16 +17,31 @@
 import "server-only";
 import { createHmac, timingSafeEqual } from "crypto";
 
-const CLIENT_ID     = process.env.CASHFREE_CLIENT_ID ?? "";
-const CLIENT_SECRET = process.env.CASHFREE_CLIENT_SECRET ?? "";
-const CF_ENV        = (process.env.CASHFREE_ENV ?? "sandbox") as "sandbox" | "production";
-const API_VERSION   = process.env.CASHFREE_API_VERSION ?? "2023-08-01";
-const APP_BASE_URL  = process.env.APP_BASE_URL ?? "http://localhost:3000";
+export function getCashfreeConfig() {
+  const clientId = (process.env.CASHFREE_CLIENT_ID ?? "").trim();
+  const clientSecret = (process.env.CASHFREE_CLIENT_SECRET ?? "").trim();
+  const rawEnv = (process.env.CASHFREE_ENV ?? "").trim().toLowerCase();
 
-const BASE_URL =
-  CF_ENV === "production"
-    ? "https://api.cashfree.com/pg"
-    : "https://sandbox.cashfree.com/pg";
+  // Auto-detect production vs sandbox if key format indicates it, or honor CASHFREE_ENV
+  let env: "sandbox" | "production" = "sandbox";
+  if (clientSecret.includes("_prod_")) {
+    env = "production";
+  } else if (clientSecret.includes("_test_")) {
+    env = "sandbox";
+  } else if (rawEnv === "production" || rawEnv === "prod") {
+    env = "production";
+  }
+
+  const baseUrl =
+    env === "production"
+      ? "https://api.cashfree.com/pg"
+      : "https://sandbox.cashfree.com/pg";
+
+  const apiVersion = process.env.CASHFREE_API_VERSION?.trim() || "2023-08-01";
+  const appBaseUrl = (process.env.APP_BASE_URL?.trim() || "http://localhost:3000").replace(/\/$/, "");
+
+  return { clientId, clientSecret, env, baseUrl, apiVersion, appBaseUrl };
+}
 
 // ─── Types ─────────────────────────────────────────────────────────────────────
 
@@ -38,7 +53,7 @@ export type CashfreeOrderStatus =
 export type CashfreeCreateOrderResult = {
   cfOrderId:    string;   // Cashfree's order ID (for checkout)
   orderId:      string;   // Our internal order ID
-  paymentLink:  string;   // Hosted checkout URL
+  checkoutUrl:  string;   // Hosted checkout URL
   sessionId:    string;   // For Cashfree.js embedded checkout
   expiresAt:    string;   // ISO8601
 };
@@ -84,16 +99,18 @@ async function cfRequest<T>(
   path: string,
   options: { method: "GET" | "POST"; body?: unknown }
 ): Promise<{ ok: boolean; data: T; status: number; error?: string }> {
-  if (!CLIENT_ID || !CLIENT_SECRET) {
+  const { clientId, clientSecret, baseUrl, apiVersion } = getCashfreeConfig();
+
+  if (!clientId || !clientSecret) {
     throw new Error("Cashfree credentials not configured. Set CASHFREE_CLIENT_ID and CASHFREE_CLIENT_SECRET.");
   }
 
-  const res = await fetch(`${BASE_URL}${path}`, {
+  const res = await fetch(`${baseUrl}${path}`, {
     method:  options.method,
     headers: {
-      "x-client-id":     CLIENT_ID,
-      "x-client-secret": CLIENT_SECRET,
-      "x-api-version":   API_VERSION,
+      "x-client-id":     clientId,
+      "x-client-secret": clientSecret,
+      "x-api-version":   apiVersion,
       "Content-Type":    "application/json",
       "Accept":          "application/json",
     },
@@ -124,8 +141,44 @@ async function cfRequest<T>(
 export async function createCashfreeOrder(params: {
   internalOrderId: string;  // Our PB-YYYY-NNNNN reference
   amount:          number;  // Rupees (integer)
+  token?:          string;  // Session token for return URL
   customerPhone?:  string;  // Optional — Cashfree can pre-fill
 }) {
+  const { env, appBaseUrl } = getCashfreeConfig();
+  const isHttps = appBaseUrl.startsWith("https://");
+
+  const orderMeta: Record<string, string> = {};
+
+  // In production mode, Cashfree strictly enforces that return_url & notify_url MUST be https.
+  // In dev (http://localhost:3000), omit them so Cashfree doesn't reject with 400 invalid_url.
+  if (isHttps) {
+    const returnUrl = params.token
+      ? `${appBaseUrl}/track/${params.internalOrderId}?k=${encodeURIComponent(params.token)}&new=1`
+      : `${appBaseUrl}/track/${params.internalOrderId}?new=1`;
+    orderMeta.return_url = returnUrl;
+    orderMeta.notify_url = `${appBaseUrl}/api/payments/webhook`;
+  } else if (env === "sandbox") {
+    // Sandbox allows http URLs for local dev testing
+    const returnUrl = params.token
+      ? `${appBaseUrl}/track/${params.internalOrderId}?k=${encodeURIComponent(params.token)}&new=1`
+      : `${appBaseUrl}/track/${params.internalOrderId}?new=1`;
+    orderMeta.return_url = returnUrl;
+  }
+
+  const payload: Record<string, unknown> = {
+    order_id:       params.internalOrderId,
+    order_amount:   params.amount,
+    order_currency: "INR",
+    customer_details: {
+      customer_id:    params.internalOrderId,
+      customer_phone: params.customerPhone ?? "9999999999",
+    },
+  };
+
+  if (Object.keys(orderMeta).length > 0) {
+    payload.order_meta = orderMeta;
+  }
+
   const result = await cfRequest<{
     cf_order_id?: string;
     order_id?: string;
@@ -136,30 +189,22 @@ export async function createCashfreeOrder(params: {
     code?: string;
   }>("/orders", {
     method: "POST",
-    body:   {
-      order_id:       params.internalOrderId,
-      order_amount:   params.amount,
-      order_currency: "INR",
-      customer_details: {
-        // Cashfree requires customer_id and customer_phone
-        // We use the order ID as the anonymous customer identifier
-        customer_id:    params.internalOrderId,
-        customer_phone: params.customerPhone ?? "9999999999",
-      },
-      order_meta: {
-        return_url:  `${APP_BASE_URL}/track/${params.internalOrderId}?new=1`,
-        notify_url:  `${APP_BASE_URL}/api/payments/webhook`,
-      },
-    },
+    body:   payload,
   });
 
   if (!result.ok || !result.data.cf_order_id || !result.data.payment_session_id) {
     throw new Error(result.error ?? "Failed to create Cashfree payment order");
   }
 
+  const checkoutUrl =
+    env === "production"
+      ? `https://payments.cashfree.com/order/#${result.data.payment_session_id}`
+      : `https://payments-test.cashfree.com/order/#${result.data.payment_session_id}`;
+
   return {
     cfOrderId:   result.data.cf_order_id,
     sessionId:   result.data.payment_session_id,
+    checkoutUrl,
     expiresAt:   result.data.order_expiry_time ?? "",
     orderId:     params.internalOrderId,
   };
@@ -253,7 +298,9 @@ export function verifyCashfreeWebhookSignature(
   timestamp: string,
   signature: string
 ): boolean {
-  if (!CLIENT_SECRET) {
+  const { clientSecret } = getCashfreeConfig();
+
+  if (!clientSecret) {
     console.error("[cashfree] CASHFREE_CLIENT_SECRET not set — cannot verify webhook");
     return false;
   }
@@ -261,7 +308,7 @@ export function verifyCashfreeWebhookSignature(
 
   try {
     const message  = timestamp + rawBody;
-    const expected = createHmac("sha256", CLIENT_SECRET)
+    const expected = createHmac("sha256", clientSecret)
       .update(message)
       .digest("base64");
 
@@ -277,10 +324,11 @@ export function verifyCashfreeWebhookSignature(
 
 // ─── Environment check ─────────────────────────────────────────────────────────
 
-export function cashfreeEnv() {
-  return CF_ENV;
+export function cashfreeEnv(): "sandbox" | "production" {
+  return getCashfreeConfig().env;
 }
 
 export function isCashfreeConfigured(): boolean {
-  return Boolean(CLIENT_ID && CLIENT_SECRET);
+  const { clientId, clientSecret } = getCashfreeConfig();
+  return Boolean(clientId && clientSecret);
 }

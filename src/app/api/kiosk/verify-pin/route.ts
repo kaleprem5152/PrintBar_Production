@@ -7,15 +7,10 @@
  * Returns the order details if PIN is valid and not expired.
  * Transitions the order from 'paid' to 'pin_accepted'.
  */
-import { and, desc, eq, inArray } from "drizzle-orm";
-import { db } from "@/db";
-import { orders } from "@/db/schema";
-import { toPublic, logAuditEvent } from "@/lib/server/orders";
+import { findOrderByPin, updateOrderStatus, toPublic, logAuditEvent } from "@/lib/server/orders";
 
 export const dynamic = "force-dynamic";
 
-// In-process rate limiting (10 attempts per 60 seconds per server process)
-// For production with multiple processes, use Redis or database-backed rate limiting
 const attempts: number[] = [];
 const MAX    = 10;
 const WINDOW = 60_000;
@@ -35,20 +30,7 @@ export async function POST(req: Request) {
   }
 
   // Look up an active order with this PIN
-  const [o] = await db
-    .select()
-    .from(orders)
-    .where(
-      and(
-        eq(orders.pin, pin),
-        inArray(orders.status, [
-          "paid", "pin_accepted", "queued", "claimed",
-          "processing", "printing", "fallback_pending",
-          "fallback_printing", "failed",
-        ]),
-      )
-    )
-    .orderBy(desc(orders.id));
+  const o = await findOrderByPin(pin);
 
   if (!o) {
     attempts.push(now);
@@ -56,19 +38,15 @@ export async function POST(req: Request) {
   }
 
   // Check PIN expiry
-  if (o.expiresAt && o.expiresAt.getTime() < now) {
+  if (o.expiresAt && new Date(o.expiresAt).getTime() < now) {
     return Response.json({ error: "expired" }, { status: 410 });
   }
 
   // Transition 'paid' → 'pin_accepted'
   let row = o;
   if (o.status === "paid") {
-    const [u] = await db
-      .update(orders)
-      .set({ status: "pin_accepted", updatedAt: new Date() })
-      .where(and(eq(orders.id, o.id), eq(orders.status, "paid")))
-      .returning();
-    if (u) row = u;
+    const updated = await updateOrderStatus(o.orderId, "pin_accepted");
+    if (updated) row = updated;
 
     await logAuditEvent({
       eventType: "pin_verified",

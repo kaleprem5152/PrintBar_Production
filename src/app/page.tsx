@@ -17,7 +17,7 @@ export default function Home() {
               <p className="inline-flex items-center gap-2 rounded-full border border-line bg-white/70 px-3.5 py-1.5 text-[13px] font-medium text-ink/70 backdrop-blur">
                 <span className="h-1.5 w-1.5 rounded-full bg-ok" /> Self-service printing kiosks
               </p>
-              <h1 className="mt-5 text-[44px] font-semibold leading-[1.02] tracking-tight sm:text-6xl lg:text-[66px]">
+              <h1 className="mt-5 text-[34px] sm:text-5xl lg:text-[66px] font-semibold leading-[1.05] tracking-tight">
                 Your documents. Printed.{" "}
                 <span className="block font-display italic font-normal text-signal">Without the wait.</span>
               </h1>
@@ -51,7 +51,7 @@ export default function Home() {
               </p>
             </div>
 
-            <div className="relative -mx-5 mt-2 h-[560px] sm:h-[640px] lg:mx-0 lg:mt-0 lg:h-[min(820px,calc(100svh-5rem))]">
+            <div className="relative -mx-5 mt-2 h-[380px] sm:h-[520px] lg:mx-0 lg:mt-0 lg:h-[min(820px,calc(100svh-5rem))]">
               <HeroScene />
             </div>
           </div>
