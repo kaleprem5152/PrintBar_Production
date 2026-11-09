@@ -305,15 +305,20 @@ class CupsManager:
                 if sheets_match:
                     result["sheets_completed"] = int(sheets_match.group(1))
 
-                if "completed" in output or "finished" in output:
+                # Strip out completed attribute keys so 'job-impressions-completed' doesn't false-trigger
+                status_text = re.sub(r"job-[a-z0-9\-]+-completed", "", output)
+                if re.search(r"\b(completed|finished)\b", status_text):
                     result["state"] = "completed"
                     result["is_active"] = False
-                elif "stopped" in output or "failed" in output:
+                elif re.search(r"\b(stopped|failed)\b", status_text):
                     result["state"] = "stopped"
                     result["is_active"] = False
-                elif "canceled" in output or "cancelled" in output:
+                elif re.search(r"\b(canceled|cancelled|aborted)\b", status_text):
                     result["state"] = "canceled"
                     result["is_active"] = False
+                elif re.search(r"\b(pending|held)\b", status_text):
+                    result["state"] = "pending"
+                    result["is_active"] = True
                 else:
                     result["state"] = "processing"
                     result["is_active"] = True
