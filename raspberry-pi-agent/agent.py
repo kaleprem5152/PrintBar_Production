@@ -61,6 +61,8 @@ from db import (
     record_command,
     complete_command,
     command_already_executed,
+    record_command_state,
+    get_command_state,
     cleanup_old_nonces,
     record_printer_state,
 )
@@ -347,13 +349,16 @@ class PrintBarAgent:
         events = get_pending_outbox(limit=5, due_only=True)
         for ev in events:
             ev_id = ev["id"]
-            event_id = ev.get("event_id") or str(ev_id)
+            event_id = ev.get("event_id")
             try:
                 payload = json.loads(ev["payload_json"])
-                url = payload.pop("_url")
+                url = payload.pop("_url", f"{CLOUD_API_URL}/api/device/jobs/{ev.get('job_id') or ''}")
                 method = payload.pop("_method", "POST").upper()
-                body = json.dumps(payload).encode("utf-8")
-                headers = get_auth_headers(body, method=method, path=url)
+                payload["eventId"] = event_id
+                req_payload = {k: v for k, v in payload.items() if not k.startswith("_")}
+                body = json.dumps(req_payload).encode("utf-8")
+                norm_path = normalize_canonical_path(url)
+                headers = get_auth_headers(body, method=method, path=norm_path)
 
                 if method == "PATCH":
                     r = requests.patch(url, data=body, headers=headers, timeout=8)
@@ -361,13 +366,15 @@ class PrintBarAgent:
                     r = requests.post(url, data=body, headers=headers, timeout=8)
 
                 if 200 <= r.status_code < 300:
-                    # Verify backend acknowledged the event
-                    data = r.json() if r.content else {}
-                    if data.get("ok") or data.get("acknowledged") or data.get("eventId") == event_id:
+                    try:
+                        data = r.json() if r.content else {}
+                    except Exception:
+                        data = {}
+                    if isinstance(data, dict) and data.get("acknowledged") is True and data.get("eventId") == event_id:
                         mark_outbox_synced(ev_id)
                         logger.debug("Outbox event #%s successfully acknowledged by cloud (HTTP %d).", event_id, r.status_code)
                     else:
-                        schedule_outbox_retry(ev_id, f"HTTP {r.status_code}: Unverified cloud payload", status_code=r.status_code)
+                        schedule_outbox_retry(ev_id, f"HTTP {r.status_code}: Mismatched or missing eventId ack", status_code=r.status_code)
                 else:
                     err = f"HTTP {r.status_code}: {r.text[:200]}"
                     logger.warning("Outbox event #%s rejected (%s). Scheduling retry.", event_id, err)
@@ -412,12 +419,35 @@ class PrintBarAgent:
         printer_id = cmd.get("printerId", "")
         payload = cmd.get("payload") or {}
 
-        if cmd_id and command_already_executed(cmd_id):
-            logger.info("Command #%s already completed locally — skipping re-execution.", cmd_id)
-            return
+        existing = get_command_state(cmd_id) if cmd_id else None
+        if existing:
+            st = existing.get("status")
+            if st == "ack_confirmed":
+                logger.info("Command #%s already fully acknowledged — skipping.", cmd_id)
+                return
+
+            if st in ("result_persisted", "ack_pending", "execution_completed"):
+                # Recover saved result and retry acknowledgement without re-executing
+                logger.info("Command #%s was already executed locally — retrying acknowledgement.", cmd_id)
+                res_obj = {}
+                try:
+                    res_obj = json.loads(existing.get("result_json") or "{}")
+                except Exception:
+                    pass
+                saved_status = res_obj.get("status", "succeeded")
+                saved_data = res_obj.get("data") or {}
+                saved_msg = str(saved_data.get("result") or res_obj.get("result") or "")
+
+                ack_ok = self._acknowledge_command(cmd_id, saved_status, saved_msg)
+                if ack_ok:
+                    record_command_state(cmd_id, action, "ack_confirmed", saved_status, {"result": saved_msg})
+                else:
+                    record_command_state(cmd_id, action, "ack_pending", saved_status, {"result": saved_msg})
+                return
 
         if cmd_id:
-            record_command(cmd_id, action)
+            record_command_state(cmd_id, action, "received")
+            record_command_state(cmd_id, action, "execution_started")
 
         logger.info("Executing remote command #%s: %s (printer: %s)", cmd_id, action, printer_id)
 
@@ -481,7 +511,7 @@ class PrintBarAgent:
                 result_msg = "Agent restarting via systemd watchdog..."
                 ack_ok = self._acknowledge_command(cmd_id, status, result_msg)
                 if cmd_id and ack_ok:
-                    complete_command(cmd_id, status, {"result": result_msg})
+                    record_command_state(cmd_id, action, "ack_confirmed", status, {"result": result_msg})
                 time.sleep(1)
                 os.execv(sys.executable, [sys.executable] + sys.argv)
                 return
@@ -495,10 +525,15 @@ class PrintBarAgent:
             result_msg = f"Exception executing '{action}': {exc}"
             logger.error(result_msg)
 
-        # STRICT: Only complete command locally if cloud confirms receipt of ack
+        # STRICT: Persist discrete states before and after backend confirmation
+        if cmd_id:
+            record_command_state(cmd_id, action, "execution_completed", status, {"result": result_msg})
+            record_command_state(cmd_id, action, "result_persisted", status, {"result": result_msg})
+            record_command_state(cmd_id, action, "ack_pending", status, {"result": result_msg})
+
         ack_confirmed = self._acknowledge_command(cmd_id, status, result_msg)
         if cmd_id and ack_confirmed:
-            complete_command(cmd_id, status, {"result": result_msg})
+            record_command_state(cmd_id, action, "ack_confirmed", status, {"result": result_msg})
 
     def _acknowledge_command(self, cmd_id: str, status: str, result: str) -> bool:
         if not cmd_id:
@@ -508,7 +543,10 @@ class PrintBarAgent:
             body = json.dumps({"status": status, "result": result[:500]}).encode("utf-8")
             headers = get_auth_headers(body, method="POST", path=path)
             res = requests.post(f"{CLOUD_API_URL}{path}", data=body, headers=headers, timeout=8)
-            return 200 <= res.status_code < 300
+            if 200 <= res.status_code < 300:
+                data = res.json() if res.content else {}
+                return bool(data.get("ok") or data.get("acknowledged"))
+            return False
         except Exception as exc:
             logger.warning("Could not acknowledge command #%s to backend: %s", cmd_id, exc)
             return False
@@ -808,18 +846,24 @@ class PrintBarAgent:
     def _cloud_request(self, path: str, payload: Dict[str, Any], method: str = "POST") -> bool:
         """
         Send API request to cloud backend with durable Outbox backup.
-        Only HTTP 2xx WITH verified response acknowledgment marks the event synced.
+        Only HTTP 2xx WITH verified matching eventId response acknowledgment marks the event synced.
         """
         url = f"{CLOUD_API_URL}{path}" if not path.startswith("http") else path
         norm_path = normalize_canonical_path(url)
 
-        # Persist event in outbox first
-        row_id = save_outbox_event("cloud_request", payload.get("orderId"), payload, DEVICE_ID)
-        event_id = payload.get("eventId")
+        # 1. Generate event UUID before saving
+        event_id = payload.get("eventId") or f"evt_{uuid.uuid4().hex}"
         payload["eventId"] = event_id
         payload["kioskId"] = DEVICE_ID
+        payload["_url"] = url
+        payload["_method"] = method
 
-        body = json.dumps(payload).encode("utf-8")
+        # 2. Persist in durable outbox
+        row_id = save_outbox_event("cloud_request", payload.get("orderId"), payload, DEVICE_ID, event_id=event_id)
+
+        # 3. Clean payload for HTTP transmission
+        req_payload = {k: v for k, v in payload.items() if not k.startswith("_")}
+        body = json.dumps(req_payload).encode("utf-8")
         headers = get_auth_headers(body, method=method, path=norm_path)
 
         try:
@@ -829,12 +873,19 @@ class PrintBarAgent:
                 res = requests.post(url, data=body, headers=headers, timeout=8)
 
             if 200 <= res.status_code < 300:
-                data = res.json() if res.content else {}
-                if data.get("ok") or data.get("acknowledged") or data.get("eventId") == event_id:
+                try:
+                    data = res.json() if res.content else {}
+                except Exception:
+                    data = {}
+
+                # Strict V4: Require explicit acknowledgement with matching eventId
+                if isinstance(data, dict) and data.get("acknowledged") is True and data.get("eventId") == event_id:
                     mark_outbox_synced(row_id)
                     return True
                 else:
-                    schedule_outbox_retry(row_id, f"HTTP {res.status_code}: Unacknowledged payload", status_code=res.status_code)
+                    err_msg = f"HTTP {res.status_code}: Missing or mismatched eventId ack (expected {event_id})"
+                    logger.warning("Cloud request to %s rejected: %s", norm_path, err_msg)
+                    schedule_outbox_retry(row_id, err_msg, status_code=res.status_code)
                     return False
             else:
                 logger.warning("Cloud request to %s rejected: HTTP %d", norm_path, res.status_code)

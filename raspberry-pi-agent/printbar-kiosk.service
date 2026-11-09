@@ -6,17 +6,8 @@ Wants=graphical.target
 [Service]
 Type=simple
 EnvironmentFile=/etc/printbar/printbar.env
-Environment=DISPLAY=:0
-ExecStartPre=/bin/sleep 5
-ExecStart=/usr/bin/chromium-browser \
-    --kiosk \
-    --disable-infobars \
-    --disable-session-crashed-bubble \
-    --disable-restore-session-state \
-    --disable-background-networking \
-    --noerrdialogs \
-    --check-for-update-interval=31536000 \
-    ${KIOSK_URL}
+ExecStartPre=/bin/sleep 3
+ExecStart=/opt/printbar/agent/start-kiosk.sh
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal

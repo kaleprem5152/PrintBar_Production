@@ -81,23 +81,15 @@ def get_auth_headers(
         logger.debug("Could not persist nonce locally: %s", exc)
 
     return {
-        "X-Device-ID":    DEVICE_ID,
-        "X-Timestamp":    ts,
-        "X-Nonce":        nonce,
-        "X-Signature":    signature,
-        # Backward compatibility aliases
-        "x-device-id":    DEVICE_ID,
-        "x-device-ts":    ts,
-        "x-device-nonce": nonce,
-        "x-device-token": signature,
-        "Content-Type":   "application/json",
+        "X-Device-ID":  DEVICE_ID,
+        "X-Timestamp":  ts,
+        "X-Nonce":      nonce,
+        "X-Signature":  signature,
+        "Content-Type": "application/json",
     }
 
 
-def validate_incoming_token(
-    *args,
-    **kwargs,
-) -> bool:
+def validate_incoming_token(*args, **kwargs) -> bool:
     """
     Local validation helper matching the server contract.
     Canonical signature: METHOD:PATH:TIMESTAMP:NONCE:BODY_SHA256
@@ -109,11 +101,9 @@ def validate_incoming_token(
         method = "POST"
         path = ""
         device_id, ts_str, nonce, token, body_bytes = args
-    elif len(args) == 6:
-        method, path, device_id, ts_str, nonce, token = args
-        body_bytes = b""
-    elif len(args) >= 7:
-        method, path, device_id, ts_str, nonce, token, body_bytes = args[:7]
+    elif len(args) >= 6:
+        method, path, device_id, ts_str, nonce, token = args[:6]
+        body_bytes = args[6] if len(args) > 6 else b""
     else:
         method = kwargs.get("method", "POST")
         path = kwargs.get("path", "")

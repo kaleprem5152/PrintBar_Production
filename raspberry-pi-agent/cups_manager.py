@@ -28,82 +28,36 @@ class CupsManager:
 
     def check_printer_status(self) -> Dict[str, Any]:
         """
-        Check authentic CUPS status for both physical printers using lpstat.
-        Returns a dict with readiness flags and raw details.
-        No simulation: missing lpstat or missing queues report explicitly not ready.
+        Delegates exclusively to the authoritative PrinterMonitor implementation.
+        Eliminates duplicate status logic, hardcoded toner flags, and fabricated readings.
         """
-        status = {
-            "cups_reachable": False,
-            "kyocera_ready": False,
-            "canon_ready": False,
-            "kyocera_status": "unknown",
-            "canon_status": "unknown",
-            "paper_ready": False,
-            "toner_ok": True,
-            "error": None,
+        from printer_monitor import PrinterMonitor, STATE_READY
+        monitor = PrinterMonitor(
+            kyocera_queue=self.kyocera_queue,
+            canon_queue=self.canon_queue,
+        )
+        all_status = monitor.get_all_printer_status()
+        k_stat = all_status.get("kyocera", {})
+        c_stat = all_status.get("canon", {})
+
+        k_ready = k_stat.get("state") == STATE_READY
+        c_ready = c_stat.get("state") == STATE_READY
+
+        cups_ok = k_stat.get("cups_state") not in (None, "missing") and c_stat.get("cups_state") not in (None, "missing")
+        err = k_stat.get("reason") or c_stat.get("reason") or None
+
+        return {
+            "cups_reachable": cups_ok,
+            "kyocera_ready": k_ready,
+            "canon_ready": c_ready,
+            "kyocera_status": k_stat.get("state", "unknown"),
+            "canon_status": c_stat.get("state", "unknown"),
+            "paper_ready": k_ready or c_ready,
+            "toner_ok": None,  # Honest: unsupported/not fabricated
+            "error": err,
+            "source": "printer_monitor",
+            "details": all_status,
         }
-
-        try:
-            res = subprocess.run(["lpstat", "-p"], capture_output=True, text=True, timeout=5)
-            if res.returncode == 0:
-                status["cups_reachable"] = True
-                output = res.stdout.lower()
-
-                # Check Kyocera queue
-                if self.kyocera_queue.lower() in output:
-                    k_match = re.search(
-                        rf"printer {re.escape(self.kyocera_queue.lower())} (is idle|is printing|is disabled)",
-                        output,
-                    )
-                    if k_match:
-                        k_state = k_match.group(1)
-                        status["kyocera_status"] = k_state
-                        status["kyocera_ready"] = "disabled" not in k_state
-                    else:
-                        status["kyocera_status"] = "unknown"
-                        status["kyocera_ready"] = False
-                else:
-                    status["kyocera_status"] = "queue_missing"
-                    status["kyocera_ready"] = False
-
-                # Check Canon queue
-                if self.canon_queue.lower() in output:
-                    c_match = re.search(
-                        rf"printer {re.escape(self.canon_queue.lower())} (is idle|is printing|is disabled)",
-                        output,
-                    )
-                    if c_match:
-                        c_state = c_match.group(1)
-                        status["canon_status"] = c_state
-                        status["canon_ready"] = "disabled" not in c_state
-                    else:
-                        status["canon_status"] = "unknown"
-                        status["canon_ready"] = False
-                else:
-                    status["canon_status"] = "queue_missing"
-                    status["canon_ready"] = False
-
-                # Both or either ready
-                status["paper_ready"] = status["kyocera_ready"] or status["canon_ready"]
-            else:
-                status["cups_reachable"] = False
-                status["error"] = f"lpstat returned non-zero ({res.returncode}): {res.stderr.strip()}"
-                logger.warning(status["error"])
-
-        except FileNotFoundError:
-            status["cups_reachable"] = False
-            status["error"] = "CUPS client binary (lpstat) not installed on host"
-            logger.error(status["error"])
-        except subprocess.TimeoutExpired:
-            status["cups_reachable"] = False
-            status["error"] = "lpstat command timed out after 5s"
-            logger.error(status["error"])
-        except Exception as e:
-            status["cups_reachable"] = False
-            status["error"] = str(e)
-            logger.error(f"Error checking printer status: {e}")
-
-        return status
 
     def print_file(
         self,

@@ -23,7 +23,7 @@ CLOUD_API_URL = os.getenv("CLOUD_API_URL", "").rstrip("/")
 # Device Identity & Authentication
 # ---------------------------------------------------------------------------
 DEVICE_ID = os.getenv("DEVICE_ID", "PB-K01")
-DEVICE_AUTH_SECRET = os.getenv("DEVICE_AUTH_SECRET", "")
+DEVICE_AUTH_SECRET = os.getenv("DEVICE_AUTH_SECRET") or os.getenv("PRINTBAR_DEVICE_SECRET") or os.getenv("KIOSK_AGENT_SECRET") or ""
 
 # ---------------------------------------------------------------------------
 # Printer Network Configuration

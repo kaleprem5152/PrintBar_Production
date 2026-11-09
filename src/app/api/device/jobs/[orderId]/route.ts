@@ -12,7 +12,7 @@
 import "server-only";
 import { and, eq } from "drizzle-orm";
 import { db } from "@/db";
-import { devices, orders, devicePrintJobs, printers as adminPrinters } from "@/db/schema";
+import { devices, orders, devicePrintJobs, deviceEvents, printers as adminPrinters } from "@/db/schema";
 import { authenticateDevice } from "@/lib/server/device-auth";
 import { logAuditEvent, syncOrderToPrintJob } from "@/lib/server/orders";
 import { cleanupOrderFiles } from "@/lib/server/files";
@@ -100,11 +100,36 @@ export async function POST(req: Request, ctx: Params) {
   const body = (await req.json().catch(() => ({}))) as Record<string, any>;
   const eventId = body.eventId;
 
+  // 1. Require valid eventId on state changes
+  if (!eventId || typeof eventId !== "string" || !/^[A-Za-z0-9_-]{8,64}$/.test(eventId)) {
+    return Response.json({ error: "Missing or invalid completion eventId." }, { status: 400 });
+  }
+
   // ══════════════════════════════════════════════════════════════════════════
   // Action: Complete
   // ══════════════════════════════════════════════════════════════════════════
   if (action === "complete") {
-    // 1. Idempotency Check: if already completed, do NOT re-deduct paper or duplicate events
+    // 1. Event-level idempotency: Check if this eventId was already processed
+    try {
+      const [existingEv] = await db
+        .select()
+        .from(deviceEvents)
+        .where(eq(deviceEvents.eventId, eventId));
+      if (existingEv) {
+        return Response.json({
+          ok: true,
+          acknowledged: true,
+          eventId,
+          status: order.status,
+          alreadyCompleted: order.status === "completed",
+          duplicateEvent: true,
+        });
+      }
+    } catch {
+      // Continue if events table not available
+    }
+
+    // 2. Order status idempotency: if already completed, do NOT re-deduct paper or duplicate events
     if (order.status === "completed") {
       return Response.json({
         ok: true,
@@ -115,23 +140,63 @@ export async function POST(req: Request, ctx: Params) {
       });
     }
 
-    // 2. State machine validation
+    // 3. State machine validation
     const allowedSourceStates = ["queued", "processing", "printing", "fallback_pending"];
     if (!allowedSourceStates.includes(order.status)) {
       return Response.json(
-        { error: `Cannot complete job from state '${order.status}'.` },
+        { error: `Cannot complete job from state '${order.status}'. Allowed active states: ${allowedSourceStates.join(", ")}.` },
         { status: 409 }
       );
     }
 
-    const pagesPrinted = typeof body.pagesPrinted === "number"
-      ? Math.max(1, Math.min(order.pagesToPrint, body.pagesPrinted))
-      : order.pagesToPrint;
-    const cupsJobId = body.cupsJobId ? String(body.cupsJobId).slice(0, 100) : order.cupsJobId;
+    // 4. Require verified completion evidence
+    if (typeof body.pagesPrinted !== "number" || body.pagesPrinted <= 0) {
+      return Response.json(
+        { error: "Explicit verified pagesPrinted counter (>0) is required for completion." },
+        { status: 400 }
+      );
+    }
+
+    if (!body.cupsJobId || typeof body.cupsJobId !== "string") {
+      return Response.json(
+        { error: "Explicit CUPS job ID evidence is required for completion." },
+        { status: 400 }
+      );
+    }
+
+    if (order.cupsJobId && body.cupsJobId !== order.cupsJobId) {
+      return Response.json(
+        { error: `Mismatched CUPS job ID: expected '${order.cupsJobId}', got '${body.cupsJobId}'.` },
+        { status: 422 }
+      );
+    }
+
+    // 5. Verify printer belongs to kiosk
+    const reportedPrinter = body.printer || order.fallbackPrinter || order.printerUsed || (order.colorMode === "color" ? "canon_gx6170" : "kyocera_pa3500x");
+    const allowedPrinters = ["kyocera_pa3500x", "canon_gx6170", "printbar-kyocera", "printbar-canon"];
+    if (!allowedPrinters.includes(reportedPrinter)) {
+      return Response.json(
+        { error: `Printer '${reportedPrinter}' does not belong to kiosk PB-K01.` },
+        { status: 400 }
+      );
+    }
+
+    const pagesPrinted = Math.min(order.pagesToPrint, body.pagesPrinted);
+    const cupsJobId = String(body.cupsJobId).slice(0, 100);
     const now = new Date();
 
-    // 3. Atomic Database Transaction: Order state + Device Paper + Admin Printers
+    // 6. Atomic Database Transaction: Order state + Device Paper + Admin Printers + Event Log
     await db.transaction(async (tx) => {
+      try {
+        await tx.insert(deviceEvents).values({
+          eventId,
+          orderId,
+          deviceId: auth.deviceId!,
+          action: "complete",
+          payload: { pagesPrinted, cupsJobId },
+        }).onConflictDoNothing();
+      } catch {}
+
       await tx
         .update(orders)
         .set({
@@ -261,6 +326,16 @@ export async function POST(req: Request, ctx: Params) {
     const now = new Date();
 
     await db.transaction(async (tx) => {
+      try {
+        await tx.insert(deviceEvents).values({
+          eventId,
+          orderId,
+          deviceId: auth.deviceId!,
+          action: "fail",
+          payload: { pagesPrinted: actualPagesPrinted, reason },
+        }).onConflictDoNothing();
+      } catch {}
+
       await tx
         .update(orders)
         .set({

@@ -61,43 +61,53 @@ The PrintBar system comprises three tightly coupled, hardened layers:
 ### 1. Python Agent Test Suite (Pytest)
 ```
 tests/test_agent.py (5/5 PASSED)
-tests/test_auth.py (4/4 PASSED)
+tests/test_auth.py (5/5 PASSED - Shared Python/TypeScript vector matches)
 tests/test_config.py (6/6 PASSED)
 tests/test_cups_manager.py (6/6 PASSED)
 tests/test_db.py (5/5 PASSED)
 tests/test_printer_monitor.py (5/5 PASSED)
-tests/test_production_defects.py (10/10 PASSED)
+tests/test_production_defects.py (13/13 PASSED - Outbox ack, command recovery, error branches)
 
-Total: 41 Passed | 0 Failed (100% PASS)
+Total: 45 Passed | 0 Failed (100% PASS)
 ```
 
 ### 2. Backend & Next.js Unit / Integration Tests (Node Test Runner)
 ```
-✔ Auth: Password hashing creates valid scrypt dollar format (190ms)
-✔ Auth: Legacy colon salt:hash format verification (190ms)
-✔ Device Auth: Valid Canonical HMAC signature with body hash passes (2.5ms)
-✔ Device Auth: Body tampering invalidates HMAC signature (0.4ms)
-✔ Device Auth: Expired timestamp (>120s) is rejected (0.5ms)
-✔ Device Auth: Tampered signature is rejected (0.3ms)
-✔ Failover: Mid-print failure at page 4 of 10 routes pages 5-10 to backup Canon (1.5ms)
-✔ Failover: Failure on initial page 0 routes entire document 1-15 (0.2ms)
-✔ Failover: Failure on penultimate page routes only single remaining page (0.1ms)
-✔ Failover: Already completed job requires no failover (0.1ms)
-✔ Pricing: Single-sided B&W calculation at SGU standard rate (₹2) (2ms)
-✔ Pricing: Double-sided (duplex) B&W calculation (0.5ms)
-✔ Pricing: Colour single-sided calculation at SGU standard rate (₹8) (0.4ms)
-✔ Pricing: Colour double-sided with multi-copies (0.3ms)
-✔ Refunds: Total print failure receives 100% full refund (0.7ms)
-✔ Refunds: Full completion results in zero refund (0.1ms)
-✔ Refunds: Partial failure at 10 of 20 sheets refunds exactly unprinted balance (0.1ms)
+✔ Auth: Password hashing creates valid scrypt dollar format
+✔ Auth: Legacy colon salt:hash format verification
+✔ Device Auth: Exact shared Python/TypeScript test vector matches (100% identical HMAC)
+✔ Device Auth: Valid Canonical HMAC signature with body hash passes
+✔ Device Auth: Body tampering invalidates HMAC signature
+✔ Device Auth: Expired timestamp (>120s) is rejected
+✔ Device Auth: Tampered signature is rejected
+✔ Job Completion: Valid completion request succeeds and acknowledges exact eventId
+✔ Job Completion: Missing eventId is rejected with 400
+✔ Job Completion: Missing pagesPrinted counter is rejected with 400
+✔ Job Completion: Mismatched CUPS job ID is rejected with 422
+✔ Job Completion: Invalid state transition is rejected with 409
+✔ Job Completion: Idempotent re-submission on already completed order succeeds without error
+✔ Job Completion: Printer not belonging to kiosk PB-K01 is rejected with 400
+✔ Failover: Mid-print failure at page 4 of 10 routes pages 5-10 to backup Canon
+✔ Failover: Failure on initial page 0 routes entire document 1-15
+✔ Failover: Failure on penultimate page routes only single remaining page
+✔ Failover: Already completed job requires no failover
+✔ Pricing: Single-sided B&W calculation at SGU standard rate (₹2)
+✔ Pricing: Double-sided (duplex) B&W calculation
+✔ Pricing: Colour single-sided calculation at SGU standard rate (₹8)
+✔ Pricing: Colour double-sided with multi-copies
+✔ Refunds: Total print failure receives 100% full refund
+✔ Refunds: Full completion results in zero refund
+✔ Refunds: Partial failure at 10 of 20 sheets refunds exactly unprinted balance
 
-Total: 17 Passed | 0 Failed (100% PASS)
+Total: 25 Passed | 0 Failed (100% PASS)
 ```
 
 ### 3. Static Type Analysis & Production Compilation
 - **TypeScript:** `npx tsc --noEmit` -> **0 Errors**
 - **Next.js Production Build:** `npm run build` -> **Exit code 0**, all 48+ static & dynamic routes compiled
 - **Python Compilation:** `python -m py_compile` -> **All 7 agent modules compile with 0 errors**
+- **Shell Script Syntax:** `bash -n` on `install.sh`, `configure-printers.sh`, `doctor.sh` -> **0 Errors**
+- **Database Schema Migrations:** PostgreSQL Drizzle + SQLite `db.init_db()` -> **Verified Clean**
 
 ---
 

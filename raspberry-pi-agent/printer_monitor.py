@@ -88,6 +88,8 @@ class PrinterMonitor:
             "canon":   self.get_unified_status("canon",   self.canon_ip,   self.canon_queue),
         }
 
+    get_all_printers_status = get_all_printer_status
+
     def get_unified_status(self, printer_id: str, ip: str, queue: str) -> Dict[str, Any]:
         """
         Determine printer state using CUPS + Network IPP + SNMP in priority order.
@@ -123,7 +125,7 @@ class PrinterMonitor:
                 state=STATE_ERROR,
                 source="cups",
                 reachable=False,
-                reason=f"CUPS queue '{queue}' does not exist on this system.",
+                reason=cups_info.get("reason") or f"CUPS queue '{queue}' does not exist on this system.",
             )
             return result
 
@@ -205,6 +207,10 @@ class PrinterMonitor:
                 reason=cups_info.get("reason", "CUPS queue state unknown"),
             )
 
+        last_succ = self.last_successful_times.get(printer_id)
+        result["is_stale"] = bool(last_succ and (now - last_succ > 120))
+        result["last_attempted_at"] = time.strftime("%Y-%m-%d %H:%M:%S IST", time.localtime(now))
+
         return result
 
     # ------------------------------------------------------------------
@@ -254,8 +260,8 @@ class PrinterMonitor:
             else:
                 info["state"] = "missing"
         except FileNotFoundError:
-            info["state"] = "missing"
-            info["reason"] = "lpstat command not found on host"
+            info["state"] = None
+            info["reason"] = "CUPS client binary (lpstat) not installed on host"
         except Exception as exc:
             info["state"] = "unknown"
             info["reason"] = str(exc)

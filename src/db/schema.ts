@@ -730,6 +730,22 @@ export const deviceNonces = pgTable(
   ]
 );
 
+export const deviceEvents = pgTable(
+  "device_events",
+  {
+    eventId: text("event_id").primaryKey(),
+    orderId: text("order_id").notNull(),
+    deviceId: text("device_id").notNull(),
+    action: text("action").notNull(),
+    payload: jsonb("payload").$type<Record<string, unknown>>().default(sql`'{}'::jsonb`),
+    createdAt: timestamp("created_at").notNull().defaultNow(),
+  },
+  (t) => [
+    index("de_order_idx").on(t.orderId),
+    index("de_device_idx").on(t.deviceId),
+  ]
+);
+
 /* Type helpers */
 export type OrderRow               = typeof orders.$inferSelect;
 export type OrderInsert            = typeof orders.$inferInsert;

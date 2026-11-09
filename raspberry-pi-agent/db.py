@@ -389,12 +389,13 @@ def save_outbox_event(
     job_id: Optional[str],
     payload: Dict[str, Any],
     kiosk_id: Optional[str] = None,
+    event_id: Optional[str] = None,
 ) -> int:
     """
     Persist an event to the local durable outbox.
     Returns database row_id (int). The payload is enriched with eventId and kioskId.
     """
-    event_id = payload.get("eventId") or f"evt_{uuid.uuid4().hex}"
+    event_id = event_id or payload.get("eventId") or f"evt_{uuid.uuid4().hex}"
     payload["eventId"] = event_id
     payload["kioskId"] = kiosk_id or DEVICE_ID
 
@@ -436,8 +437,6 @@ def get_pending_outbox(limit: int = 10, due_only: bool = False) -> List[Dict[str
 
 def mark_outbox_synced(event_id_or_row_id: Any) -> None:
     """Mark an event confirmed acknowledged by the cloud backend."""
-    if isinstance(event_id_or_row_id, (tuple, list)):
-        event_id_or_row_id = event_id_or_row_id[0]
     with get_connection() as conn:
         if isinstance(event_id_or_row_id, int):
             conn.execute("""
@@ -463,8 +462,6 @@ def schedule_outbox_retry(
     Classify error and schedule next retry using jittered exponential backoff.
     Never abandons events.
     """
-    if isinstance(event_id_or_row_id, (tuple, list)):
-        event_id_or_row_id = event_id_or_row_id[0]
     category = "network_error"
     if status_code == 401 or status_code == 403:
         category = "auth_error"
@@ -544,35 +541,58 @@ def cleanup_old_nonces(max_age_seconds: int = 7200) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Command history with execution status
+# Command history with granular execution status
 # ---------------------------------------------------------------------------
 
-def record_command(command_id: str, command: str) -> None:
+def record_command_state(
+    command_id: str,
+    command: str,
+    state: str,
+    result_status: Optional[str] = None,
+    result_data: Optional[Dict[str, Any]] = None,
+) -> None:
+    """
+    Persist discrete command states:
+      received -> execution_started -> execution_completed ->
+      result_persisted -> ack_pending -> ack_confirmed
+    """
     with get_connection() as conn:
+        payload = None
+        if result_status or result_data:
+            payload = json.dumps({"status": result_status, "data": result_data})
+
         conn.execute("""
-            INSERT OR IGNORE INTO command_history (command_id, command, status)
-            VALUES (?, ?, 'running')
-        """, (command_id, command))
+            INSERT INTO command_history (command_id, command, status, result_json, executed_at)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(command_id) DO UPDATE SET
+                status = excluded.status,
+                result_json = coalesce(excluded.result_json, command_history.result_json),
+                executed_at = CURRENT_TIMESTAMP
+        """, (command_id, command, state, payload))
         conn.commit()
+
+
+def get_command_state(command_id: str) -> Optional[Dict[str, Any]]:
+    """Retrieve full durable command state and saved execution result."""
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM command_history WHERE command_id = ? LIMIT 1", (command_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def record_command(command_id: str, command: str) -> None:
+    record_command_state(command_id, command, "received")
+    record_command_state(command_id, command, "execution_started")
 
 
 def complete_command(command_id: str, status: str, result: Optional[Dict] = None) -> None:
-    with get_connection() as conn:
-        conn.execute("""
-            UPDATE command_history
-            SET status = ?, executed_at = CURRENT_TIMESTAMP, result_json = ?
-            WHERE command_id = ?
-        """, (status, json.dumps(result) if result else None, command_id))
-        conn.commit()
+    record_command_state(command_id, "", "ack_confirmed", status, result)
 
 
 def command_already_executed(command_id: str) -> bool:
-    with get_connection() as conn:
-        row = conn.execute(
-            "SELECT status FROM command_history WHERE command_id = ? LIMIT 1",
-            (command_id,),
-        ).fetchone()
-        return row is not None and row["status"] in ("succeeded", "failed")
+    state = get_command_state(command_id)
+    if not state:
+        return False
+    return state.get("status") in ("ack_confirmed", "result_persisted", "ack_pending")
 
 
 # ---------------------------------------------------------------------------

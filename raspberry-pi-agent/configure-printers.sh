@@ -39,47 +39,63 @@ check_port() {
     timeout 3 bash -c "echo >/dev/tcp/${ip}/${port}" 2>/dev/null
 }
 
-info "Testing network connectivity to printers..."
-check_port "${KYOCERA_IP}" 631 && pass "Kyocera IPP (631) reachable" || warn "Kyocera IPP (631) port unreachable"
-check_port "${CANON_IP}" 631 && pass "Canon IPP (631) reachable" || warn "Canon IPP (631) port unreachable"
-
-# Determine URIs
-KYOCERA_URI="ipp://${KYOCERA_IP}:631/ipp/print"
-CANON_URI="ipp://${CANON_IP}:631/ipp/print"
-
+info "Testing IPP capabilities on port 631..."
 if ! check_port "${KYOCERA_IP}" 631; then
-    if check_port "${KYOCERA_IP}" 9100; then
-        KYOCERA_URI="socket://${KYOCERA_IP}:9100"
-        warn "Using raw socket for Kyocera: ${KYOCERA_URI}"
-    else
-        fail "Kyocera is not reachable on ports 631 or 9100"
-        exit 1
-    fi
+    fail "Kyocera PA3500x IPP service (port 631) is not reachable at ${KYOCERA_IP}."
+    fail "Both PrintBar printers require driverless IPP Everywhere (RFC 8011) on port 631. Raw -m raw fallback is discontinued."
+    exit 1
 fi
 
 if ! check_port "${CANON_IP}" 631; then
-    if check_port "${CANON_IP}" 9100; then
-        CANON_URI="socket://${CANON_IP}:9100"
-        warn "Using raw socket for Canon: ${CANON_URI}"
-    else
-        fail "Canon is not reachable on ports 631 or 9100"
-        exit 1
-    fi
+    fail "Canon GX6170 IPP service (port 631) is not reachable at ${CANON_IP}."
+    fail "Both PrintBar printers require driverless IPP Everywhere (RFC 8011) on port 631. Raw -m raw fallback is discontinued."
+    exit 1
 fi
 
-info "Configuring CUPS queues..."
+KYOCERA_URI="ipp://${KYOCERA_IP}:631/ipp/print"
+CANON_URI="ipp://${CANON_IP}:631/ipp/print"
+pass "IPP endpoints validated: ${KYOCERA_URI} and ${CANON_URI}"
 
-# Safe configuration without prior queue deletion
-lpadmin -p "${KYOCERA_QUEUE}" -E -v "${KYOCERA_URI}" -m everywhere 2>/dev/null || \
-lpadmin -p "${KYOCERA_QUEUE}" -E -v "${KYOCERA_URI}" -m raw 2>/dev/null || \
-warn "Could not apply driverless PPD for Kyocera"
+info "Configuring driverless IPP Everywhere queues (safe staged replacement)..."
 
-lpadmin -p "${CANON_QUEUE}" -E -v "${CANON_URI}" -m everywhere 2>/dev/null || \
-lpadmin -p "${CANON_QUEUE}" -E -v "${CANON_URI}" -m raw 2>/dev/null || \
-warn "Could not apply driverless PPD for Canon"
+# Stage Kyocera configuration safely
+KYOCERA_TEST="pb-test-kyocera"
+lpadmin -p "${KYOCERA_TEST}" -E -v "${KYOCERA_URI}" -m everywhere 2>/dev/null || {
+    fail "Could not register driverless PPD for Kyocera via IPP Everywhere. Check printer IPP configuration."
+    exit 1
+}
+# Validate required options (duplex, monochrome)
+if lpoptions -p "${KYOCERA_TEST}" -l &>/dev/null; then
+    pass "Kyocera driverless capabilities successfully queried."
+    lpadmin -x "${KYOCERA_TEST}" 2>/dev/null || true
+    lpadmin -p "${KYOCERA_QUEUE}" -E -v "${KYOCERA_URI}" -m everywhere
+    cupsenable "${KYOCERA_QUEUE}" 2>/dev/null || true
+    cupsaccept "${KYOCERA_QUEUE}" 2>/dev/null || true
+    pass "Queue '${KYOCERA_QUEUE}' registered."
+else
+    lpadmin -x "${KYOCERA_TEST}" 2>/dev/null || true
+    fail "Failed to query Kyocera capabilities. Preserving existing queue."
+    exit 1
+fi
 
-cupsenable "${KYOCERA_QUEUE}" "${CANON_QUEUE}" 2>/dev/null || true
-cupsaccept "${KYOCERA_QUEUE}" "${CANON_QUEUE}" 2>/dev/null || true
+# Stage Canon configuration safely
+CANON_TEST="pb-test-canon"
+lpadmin -p "${CANON_TEST}" -E -v "${CANON_URI}" -m everywhere 2>/dev/null || {
+    fail "Could not register driverless PPD for Canon via IPP Everywhere. Check printer IPP configuration."
+    exit 1
+}
+if lpoptions -p "${CANON_TEST}" -l &>/dev/null; then
+    pass "Canon driverless capabilities successfully queried."
+    lpadmin -x "${CANON_TEST}" 2>/dev/null || true
+    lpadmin -p "${CANON_QUEUE}" -E -v "${CANON_URI}" -m everywhere
+    cupsenable "${CANON_QUEUE}" 2>/dev/null || true
+    cupsaccept "${CANON_QUEUE}" 2>/dev/null || true
+    pass "Queue '${CANON_QUEUE}' registered."
+else
+    lpadmin -x "${CANON_TEST}" 2>/dev/null || true
+    fail "Failed to query Canon capabilities. Preserving existing queue."
+    exit 1
+fi
 
 # Update environment file
 if [[ -f "${CONFIG_FILE}" ]]; then

@@ -222,3 +222,77 @@ def test_mid_print_failure_manual_review(dev_env, fresh_db, tmp_path):
                         with fresh_db.get_connection() as conn:
                             row = conn.execute("SELECT status FROM local_jobs WHERE order_id = 'ORD-JAM'").fetchone()
                         assert row["status"] == "manual_review"
+
+
+# 11. Exact event acknowledgement required (generic ok: true rejected)
+def test_exact_event_acknowledgement_required(dev_env, fresh_db):
+    with patch("agent.validate_config"):
+        agent = PrintBarAgent()
+
+    with patch("requests.post") as mock_post:
+        # Generic {ok: true} without matching eventId must be rejected
+        res_generic = MagicMock()
+        res_generic.status_code = 200
+        res_generic.json.return_value = {"ok": True}
+        res_generic.content = b'{"ok": true}'
+        mock_post.return_value = res_generic
+
+        ok = agent._cloud_request("/api/device/jobs/TEST-ACK", {"orderId": "TEST-ACK", "eventId": "evt_expected_123"})
+        assert ok is False
+
+        # Response with exact matching eventId and acknowledged: true must succeed
+        res_exact = MagicMock()
+        res_exact.status_code = 200
+        res_exact.json.return_value = {"ok": True, "acknowledged": True, "eventId": "evt_expected_456"}
+        res_exact.content = b'{"ok": true, "acknowledged": true, "eventId": "evt_expected_456"}'
+        mock_post.return_value = res_exact
+
+        ok = agent._cloud_request("/api/device/jobs/TEST-ACK2", {"orderId": "TEST-ACK2", "eventId": "evt_expected_456"})
+        assert ok is True
+
+
+# 12. Command acknowledgement recovery without re-execution
+def test_command_acknowledgement_recovery(dev_env, fresh_db):
+    with patch("agent.validate_config"):
+        agent = PrintBarAgent()
+
+    cmd = {"id": "CMD-RECOVER-1", "command": "clear_stuck_jobs", "payload": {}}
+
+    # First attempt: execution succeeds locally, but backend ack fails (e.g. network timeout)
+    with patch.object(agent.cups, "clear_stuck_jobs", return_value=True) as mock_cups_clear:
+        with patch.object(agent, "_acknowledge_command", return_value=False):
+            agent._execute_command(cmd)
+            mock_cups_clear.assert_called_once()
+
+    # State must be ack_pending or result_persisted
+    cmd_state = fresh_db.get_command_state("CMD-RECOVER-1")
+    assert cmd_state["status"] == "ack_pending"
+
+    # Second attempt: must NOT call clear_stuck_jobs again! Must reload result and retry ack
+    with patch.object(agent.cups, "clear_stuck_jobs") as mock_cups_second:
+        with patch.object(agent, "_acknowledge_command", return_value=True) as mock_ack:
+            agent._execute_command(cmd)
+            # CUPS clear_stuck_jobs must NOT be executed a second time
+            mock_cups_second.assert_not_called()
+            # Acknowledgement must be retried
+            mock_ack.assert_called_once()
+
+    # After confirmed ack, state is ack_confirmed
+    cmd_state_final = fresh_db.get_command_state("CMD-RECOVER-1")
+    assert cmd_state_final["status"] == "ack_confirmed"
+
+
+# 13. Unknown command returns failed
+def test_unknown_command_returns_failed(dev_env, fresh_db):
+    with patch("agent.validate_config"):
+        agent = PrintBarAgent()
+
+    cmd = {"id": "CMD-UNKNOWN-99", "command": "destroy_hardware_xyz", "payload": {}}
+
+    with patch.object(agent, "_acknowledge_command") as mock_ack:
+        agent._execute_command(cmd)
+        mock_ack.assert_called_once()
+        args = mock_ack.call_args[0]
+        assert args[0] == "CMD-UNKNOWN-99"
+        assert args[1] == "failed"
+        assert "unsupported" in args[2].lower() or "unknown" in args[2].lower()

@@ -63,11 +63,19 @@ export async function authenticateDevice(req: Request): Promise<{
   deviceId?: string;
   error?: string;
 }> {
-  // Read headers (supporting both standard X-Signature and x-device-token)
+  // Disallow legacy authentication headers
+  if (req.headers.has("x-agent-key")) {
+    return {
+      ok: false,
+      error: "Legacy raw secret authentication (x-agent-key) is permanently discontinued.",
+    };
+  }
+
+  // Strictly enforce canonical authentication headers
   const deviceId  = req.headers.get("x-device-id") ?? "";
-  const signature = req.headers.get("x-signature") ?? req.headers.get("x-device-token") ?? "";
-  const tsHeader  = req.headers.get("x-timestamp") ?? req.headers.get("x-device-ts") ?? "";
-  const nonce     = req.headers.get("x-nonce") ?? req.headers.get("x-device-nonce") ?? "";
+  const signature = req.headers.get("x-signature") ?? "";
+  const tsHeader  = req.headers.get("x-timestamp") ?? "";
+  const nonce     = req.headers.get("x-nonce") ?? "";
 
   // 1. Validate required headers presence and device identity format
   if (!deviceId || !signature || !tsHeader || !nonce) {
@@ -81,14 +89,14 @@ export async function authenticateDevice(req: Request): Promise<{
     return { ok: false, error: "Invalid device ID format." };
   }
 
-  // 2. Validate timestamp freshness
+  // 2. Validate timestamp freshness (<=120s clock skew)
   const ts = parseInt(tsHeader, 10);
   const now = Math.floor(Date.now() / 1000);
   if (isNaN(ts) || Math.abs(now - ts) > MAX_CLOCK_SKEW_SECONDS) {
     return { ok: false, error: "Request timestamp is outside the allowed clock tolerance window." };
   }
 
-  // 3. Validate nonce format (hex/alphanumeric 16-64 chars)
+  // 3. Validate nonce format (alphanumeric 16-64 chars)
   if (!/^[A-Za-z0-9_-]{16,64}$/.test(nonce)) {
     return { ok: false, error: "Invalid nonce format." };
   }
@@ -107,7 +115,7 @@ export async function authenticateDevice(req: Request): Promise<{
     bodySha256 = EMPTY_BODY_SHA256;
   }
 
-  // Authoritative secret
+  // Authoritative secret resolution
   const secret = process.env.DEVICE_AUTH_SECRET || process.env.PRINTBAR_DEVICE_SECRET || "";
   if (!secret) {
     console.error("[device-auth] DEVICE_AUTH_SECRET is not configured on server");
@@ -119,18 +127,12 @@ export async function authenticateDevice(req: Request): Promise<{
   const canonicalMessage = buildCanonicalMessage(req.method, normPath, tsHeader, nonce, bodySha256);
   const expectedSignature = createHmac("sha256", secret).update(canonicalMessage).digest("hex");
 
-  // 6. Verify HMAC using constant-time comparison
+  // 6. Verify HMAC using constant-time comparison (NO fallback signature allowed)
   const givenBuf    = Buffer.from(signature, "utf8");
   const expectedBuf = Buffer.from(expectedSignature, "utf8");
 
   if (givenBuf.length !== expectedBuf.length || !timingSafeEqual(givenBuf, expectedBuf)) {
-    // Check fallback canonical without method:path if path was rewriten by proxy
-    const altMessage = `${deviceId}:${tsHeader}:${nonce}:${bodySha256}`;
-    const altExpected = createHmac("sha256", secret).update(altMessage).digest("hex");
-    const altBuf = Buffer.from(altExpected, "utf8");
-    if (givenBuf.length !== altBuf.length || !timingSafeEqual(givenBuf, altBuf)) {
-      return { ok: false, error: "HMAC signature verification failed." };
-    }
+    return { ok: false, error: "HMAC signature verification failed." };
   }
 
   // 7 & 8. Atomically consume nonce in PostgreSQL (Only executed AFTER valid signature!)
@@ -146,9 +148,7 @@ export async function authenticateDevice(req: Request): Promise<{
     }
   } catch (dbErr) {
     console.error("[device-auth] PostgreSQL replay protection error:", (dbErr as Error).message);
-    if (process.env.NODE_ENV === "production") {
-      return { ok: false, error: "Database replay protection is currently unavailable." };
-    }
+    return { ok: false, error: "Durable replay protection unavailable. Request rejected." };
   }
 
   // 9. Verify device registration in DB

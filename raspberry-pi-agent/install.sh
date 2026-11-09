@@ -118,12 +118,17 @@ fi
 pass "Python environment ready"
 
 # 8. Data directories
-info "[5/8] Initialising data directories..."
+info "[5/8] Initialising data directories & database schema..."
 mkdir -p "${DATA_DIR}" "${JOBS_DIR}" "${LOG_DIR}"
 chown -R "${SERVICE_USER}:${SERVICE_USER}" "${DATA_DIR}" "${LOG_DIR}"
 chmod 750 "${DATA_DIR}" "${LOG_DIR}"
 chmod 700 "${JOBS_DIR}"
-pass "Data directories configured"
+
+# Run database migrations to ensure local SQLite schema is at latest version
+info "Applying local database schema migrations..."
+PYTHONPATH="${AGENT_DIR}" "${VENV_DIR}/bin/python" -c "import db; db.init_db()"
+chown -R "${SERVICE_USER}:${SERVICE_USER}" "${DATA_DIR}"
+pass "Data directories and SQLite database initialized"
 
 # 9. Configuration file
 info "[6/8] Checking configuration..."
@@ -131,16 +136,31 @@ mkdir -p "${CONFIG_DIR}"
 chmod 750 "${CONFIG_DIR}"
 
 if [[ -f "${CONFIG_FILE}" ]]; then
-    pass "Configuration preserved at ${CONFIG_FILE}"
+    pass "Existing configuration preserved at ${CONFIG_FILE} (secrets untouched)"
 else
-    GENERATED_SECRET=$(openssl rand -hex 32)
+    # Resolve secret from environment or local .env if available
+    TARGET_CLOUD_URL="${CLOUD_API_URL:-https://printbarproduction-production.up.railway.app}"
+    TARGET_SECRET="${DEVICE_AUTH_SECRET:-${PRINTBAR_DEVICE_SECRET:-}}"
+
+    if [[ -z "${TARGET_SECRET}" && -f "${SCRIPT_DIR}/.env" ]]; then
+        TARGET_SECRET=$(grep -E '^(DEVICE_AUTH_SECRET|PRINTBAR_DEVICE_SECRET)=' "${SCRIPT_DIR}/.env" | head -n1 | cut -d= -f2- | tr -d '"'\''')
+    fi
+
+    if [[ -z "${TARGET_SECRET}" ]]; then
+        warn "No existing DEVICE_AUTH_SECRET provided in environment. Generating placeholder key."
+        TARGET_SECRET=$(openssl rand -hex 32)
+        warn "ATTENTION: You MUST configure matching DEVICE_AUTH_SECRET in Railway and ${CONFIG_FILE} before production usage!"
+    else
+        pass "Using registered device secret from provisioning environment"
+    fi
+
     cat > "${CONFIG_FILE}" <<EOF
 # PrintBar Agent Production Configuration
-# Generated on $(date -Iseconds)
+# Installed on $(date -Iseconds)
 
-CLOUD_API_URL=https://printbarproduction-production.up.railway.app
+CLOUD_API_URL=${TARGET_CLOUD_URL}
 DEVICE_ID=PB-K01
-DEVICE_AUTH_SECRET=${GENERATED_SECRET}
+DEVICE_AUTH_SECRET=${TARGET_SECRET}
 
 KYOCERA_IP=
 CANON_IP=
@@ -158,19 +178,19 @@ LOG_LEVEL=INFO
 
 DOCUMENT_STORAGE_DIR=${JOBS_DIR}
 LOCAL_DATA_DIR=${DATA_DIR}
-KIOSK_URL=https://printbarproduction-production.up.railway.app/kiosk
+KIOSK_URL=${TARGET_CLOUD_URL}/kiosk
 EOF
     chmod 640 "${CONFIG_FILE}"
     chown root:"${SERVICE_USER}" "${CONFIG_FILE}"
-    pass "Created configuration template at ${CONFIG_FILE}"
+    pass "Created configuration at ${CONFIG_FILE}"
 fi
 
-# 10. Minimal Sudoers
+# 10. Minimal Sudoers (No unnecessary lpadmin privileges)
 info "[7/8] Securing sudoers privileges..."
 cat > "${SUDOERS_FILE}" <<'EOF'
-# PrintBar minimal hardware agent permissions
+# PrintBar minimal hardware agent permissions (Principle of Least Privilege)
 printbar ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart cups
-printbar ALL=(ALL) NOPASSWD: /usr/sbin/lpadmin
+printbar ALL=(ALL) NOPASSWD: /usr/sbin/cupsenable
 printbar ALL=(ALL) NOPASSWD: /usr/bin/lpstat
 printbar ALL=(ALL) NOPASSWD: /usr/bin/lp
 printbar ALL=(ALL) NOPASSWD: /usr/bin/cancel
@@ -178,6 +198,56 @@ EOF
 chmod 440 "${SUDOERS_FILE}"
 visudo -c -f "${SUDOERS_FILE}" || { fail "Sudoers syntax check failed"; exit 1; }
 pass "Minimal sudoers established"
+
+# Create kiosk session launcher
+cat > "${AGENT_DIR}/start-kiosk.sh" <<'EOF'
+#!/usr/bin/env bash
+# PrintBar Dynamic Display & Session Launcher
+set -euo pipefail
+
+CONFIG_FILE="/etc/printbar/printbar.env"
+if [[ -f "${CONFIG_FILE}" ]]; then
+    set -a
+    source "${CONFIG_FILE}"
+    set +a
+fi
+
+KIOSK_URL="${KIOSK_URL:-https://printbarproduction-production.up.railway.app/kiosk}"
+
+# Dynamically detect active display or wayland compositor
+if [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ]]; then
+    if [[ -e "/tmp/.X11-unix/X0" ]]; then
+        export DISPLAY=:0
+    elif [[ -n "$(ls /run/user/$(id -u)/wayland-* 2>/dev/null)" ]]; then
+        export WAYLAND_DISPLAY=$(basename $(ls /run/user/$(id -u)/wayland-* | head -n1))
+    else
+        export DISPLAY=:0
+    fi
+fi
+
+if [[ -f "${HOME}/.Xauthority" && -z "${XAUTHORITY:-}" ]]; then
+    export XAUTHORITY="${HOME}/.Xauthority"
+fi
+
+CHROMIUM_BIN=$(command -v chromium-browser || command -v chromium || command -v google-chrome || echo "")
+if [[ -z "${CHROMIUM_BIN}" ]]; then
+    echo "[FAIL] Chromium not found." >&2
+    exit 1
+fi
+
+exec "${CHROMIUM_BIN}" \
+    --kiosk \
+    --disable-infobars \
+    --disable-session-crashed-bubble \
+    --disable-restore-session-state \
+    --disable-background-networking \
+    --noerrdialogs \
+    --check-for-update-interval=31536000 \
+    "${KIOSK_URL}"
+EOF
+chmod 755 "${AGENT_DIR}/start-kiosk.sh"
+chown root:root "${AGENT_DIR}/start-kiosk.sh"
+pass "Kiosk dynamic session launcher created"
 
 # 11. Systemd Units
 info "[8/8] Installing systemd units..."
@@ -223,19 +293,9 @@ Wants=graphical.target
 [Service]
 Type=simple
 User=${DETECTED_USER}
-Environment=DISPLAY=:0
-Environment=XAUTHORITY=${USER_HOME}/.Xauthority
 EnvironmentFile=${CONFIG_FILE}
-ExecStartPre=/bin/sleep 5
-ExecStart=${CHROMIUM_BIN} \\
-    --kiosk \\
-    --disable-infobars \\
-    --disable-session-crashed-bubble \\
-    --disable-restore-session-state \\
-    --disable-background-networking \\
-    --noerrdialogs \\
-    --check-for-update-interval=31536000 \\
-    \${KIOSK_URL}
+ExecStartPre=/bin/sleep 3
+ExecStart=${AGENT_DIR}/start-kiosk.sh
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal
