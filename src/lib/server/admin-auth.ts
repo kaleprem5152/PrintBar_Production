@@ -15,3 +15,4 @@ export async function clearAdminSessionCookie() {
   jar.delete("pb_admin_session");
   jar.delete("pb_session");
 }
+

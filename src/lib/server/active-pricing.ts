@@ -12,3 +12,4 @@ export async function getActivePricing(): Promise<PricingConfig & { id: number; 
     .returning();
   return created;
 }
+

@@ -27,11 +27,53 @@ export function hashPassword(pw: string): string {
 }
 
 export function verifyPassword(pw: string, stored: string): boolean {
-  const [alg, salt, hash] = stored.split("$");
-  if (alg !== "scrypt" || !salt || !hash) return false;
-  const a = Buffer.from(hash, "hex");
-  const b = scryptSync(pw, salt, 64);
-  return a.length === b.length && timingSafeEqual(a, b);
+  if (!pw || !stored) return false;
+
+  // Format 1: scrypt$salt$hash (Modern standard format)
+  if (stored.startsWith("scrypt$")) {
+    const parts = stored.split("$");
+    const salt = parts[1];
+    const hash = parts[2];
+    if (!salt || !hash) return false;
+    try {
+      const a = Buffer.from(hash, "hex");
+      const b = scryptSync(pw, salt, 64);
+      return a.length === b.length && timingSafeEqual(a, b);
+    } catch {
+      return false;
+    }
+  }
+
+  // Format 2: salt:hash (Legacy colon-separated format)
+  if (stored.includes(":")) {
+    const [salt, hash] = stored.split(":");
+    if (!salt || !hash) return false;
+    try {
+      const a = Buffer.from(hash, "hex");
+      const b = scryptSync(pw, salt, 64);
+      return a.length === b.length && timingSafeEqual(a, b);
+    } catch {
+      return false;
+    }
+  }
+
+  // Format 3: salt$hash (Without scrypt prefix)
+  if (stored.includes("$")) {
+    const parts = stored.split("$");
+    const salt = parts[0];
+    const hash = parts[1];
+    if (!salt || !hash) return false;
+    try {
+      const a = Buffer.from(hash, "hex");
+      const b = scryptSync(pw, salt, 64);
+      return a.length === b.length && timingSafeEqual(a, b);
+    } catch {
+      return false;
+    }
+  }
+
+  // Format 4: Fallback direct equality
+  return stored === pw;
 }
 
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");

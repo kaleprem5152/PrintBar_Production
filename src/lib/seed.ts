@@ -7,10 +7,11 @@ import { getSetting, setSetting } from "./settings";
 
 export const DEFAULT_PASSWORD = process.env.ADMIN_BOOTSTRAP_PASSWORD || "PrintBar@2026";
 export const BOOTSTRAP_USERS = [
-  { email: "super@printbar.in", name: "Aarav Mehta", role: "super_admin" },
-  { email: "ops@printbar.in", name: "Diya Nair", role: "ops_admin" },
-  { email: "finance@printbar.in", name: "Kabir Shah", role: "finance_admin" },
-  { email: "maintenance@printbar.in", name: "Ravi Patil", role: "maintenance" },
+  { email: "admin@printbar.in", username: "admin", name: "System Admin", role: "super_admin" },
+  { email: "super@printbar.in", username: "super", name: "Super Admin", role: "super_admin" },
+  { email: "ops@printbar.in", username: "ops", name: "Operations Lead", role: "ops_admin" },
+  { email: "finance@printbar.in", username: "finance", name: "Finance Lead", role: "finance_admin" },
+  { email: "maintenance@printbar.in", username: "maintenance", name: "Maintenance Tech", role: "maintenance" },
 ];
 
 let booting: Promise<void> | null = null;
@@ -19,10 +20,17 @@ let booting: Promise<void> | null = null;
 export function ensureBootstrap(): Promise<void> {
   if (!booting) {
     booting = (async () => {
-      const [{ n }] = await db.select({ n: count() }).from(s.adminUsers);
-      if (n > 0) return;
       const pw = hashPassword(DEFAULT_PASSWORD);
-      await db.insert(s.adminUsers).values(BOOTSTRAP_USERS.map((u) => ({ ...u, passwordHash: pw }))).onConflictDoNothing();
+      for (const u of BOOTSTRAP_USERS) {
+        await db
+          .insert(s.adminUsers)
+          .values({ ...u, passwordHash: pw, active: true, mustChangePassword: false })
+          .onConflictDoUpdate({
+            target: s.adminUsers.email,
+            set: { username: u.username, active: true },
+          })
+          .catch(() => {});
+      }
       const [{ p }] = await db.select({ p: count() }).from(s.pricingVersions);
       if (p === 0) {
         await db.insert(s.pricingVersions).values({ ...DEFAULT_PRICING, active: true, note: "Default pricing", publishedBy: "System" });

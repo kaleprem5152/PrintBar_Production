@@ -29,6 +29,7 @@ export type NotifyPrefs = {
 export const adminUsers = pgTable("admin_users", {
   id: serial("id").primaryKey(),
   email: text("email").notNull().unique(),
+  username: text("username"),
   name: text("name").notNull(),
   role: text("role").notNull(), // super_admin | ops_admin | finance_admin | maintenance
   passwordHash: text("password_hash").notNull(),
