@@ -1,28 +1,31 @@
 """
-Local SQLite database for the PrintBar Raspberry Pi Agent.
+Local SQLite database for the PrintBar Raspberry Pi Agent (PB-K01).
 
-Production-grade features:
-- WAL journal mode for concurrent reads & crash recovery
-- Foreign key enforcement
-- 5-second busy timeout
+Production-grade features (V4 Spec):
+- WAL journal mode for concurrent reads & durable crash recovery
+- Foreign key constraints enabled
+- 5000ms busy timeout
 - Schema versioning with safe migrations
-- Durable Outbox pattern with exponential backoff & telemetry visibility (no silent drops)
+- Durable Outbox pattern with unique UUID event IDs, jittered exponential backoff,
+  error categorization, and telemetry backlog visibility (never silently lost)
 - Print attempt history & physical output auditing
-- Idempotent job claim protection (never overwrites existing progress or attempt history)
-- Durable nonce storage for local replay protection
+- Idempotent job claim protection (never overwrites in-flight progress or attempt history)
+- Durable nonce storage for local replay prevention
 - Printer state history
 - Remote command history with leases and execution confirmation
 """
 import sqlite3
 import json
 import logging
+import random
+import uuid
 from datetime import datetime
 from typing import Optional, Dict, Any, List
-from config import SQLITE_DB_PATH
+from config import SQLITE_DB_PATH, DEVICE_ID
 
 logger = logging.getLogger("printbar.db")
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def get_connection() -> sqlite3.Connection:
@@ -108,6 +111,8 @@ def init_db() -> None:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS outbox_events (
                     id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id     TEXT UNIQUE,
+                    kiosk_id     TEXT,
                     event_type   TEXT NOT NULL,
                     job_id       TEXT,
                     payload_json TEXT NOT NULL,
@@ -154,7 +159,6 @@ def init_db() -> None:
 
         if current < 4:
             logger.info("Applying schema migration v4: outbox backoff schedule & backlogs")
-            # Add next_retry_at column if not present
             try:
                 conn.execute("ALTER TABLE outbox_events ADD COLUMN next_retry_at TIMESTAMP")
             except Exception:
@@ -164,6 +168,22 @@ def init_db() -> None:
             except Exception:
                 pass
             _set_schema_version(conn, 4)
+
+        if current < 5:
+            logger.info("Applying schema migration v5: full event_id, error_category and kiosk_id columns")
+            try:
+                conn.execute("ALTER TABLE outbox_events ADD COLUMN error_category TEXT DEFAULT 'none'")
+            except Exception:
+                pass
+            try:
+                conn.execute("ALTER TABLE outbox_events ADD COLUMN event_id TEXT")
+            except Exception:
+                pass
+            try:
+                conn.execute("ALTER TABLE outbox_events ADD COLUMN kiosk_id TEXT")
+            except Exception:
+                pass
+            _set_schema_version(conn, 5)
 
         conn.commit()
     logger.info("Database initialized at schema version %d", SCHEMA_VERSION)
@@ -185,12 +205,6 @@ def record_job_claimed(
     sided: str = "single",
     pages_per_sheet: int = 1,
 ) -> None:
-    """
-    Record or preserve claimed job.
-    CRITICAL: If the job is already processing, printing, completed, or failed,
-    an accidental re-claim must NEVER overwrite pages_printed, attempt history,
-    or recovery state.
-    """
     key = idempotency_key or order_id
     with get_connection() as conn:
         existing = conn.execute(
@@ -199,7 +213,6 @@ def record_job_claimed(
         ).fetchone()
 
         if existing:
-            # Job already exists — preserve active/terminal state
             if existing["status"] in ("processing", "printing", "completed", "failed", "manual_review"):
                 logger.info(
                     "Job %s already exists in state '%s' with %d pages — preserving progress.",
@@ -368,73 +381,132 @@ def update_print_attempt(
 
 
 # ---------------------------------------------------------------------------
-# Outbox (Durable queue with backoff schedule — NEVER silently abandoned)
+# Outbox (Durable queue with unique event_id, backoff with jitter)
 # ---------------------------------------------------------------------------
 
-def save_outbox_event(event_type: str, job_id: Optional[str], payload: Dict[str, Any]) -> int:
+def save_outbox_event(
+    event_type: str,
+    job_id: Optional[str],
+    payload: Dict[str, Any],
+    kiosk_id: Optional[str] = None,
+) -> int:
+    """
+    Persist an event to the local durable outbox.
+    Returns database row_id (int). The payload is enriched with eventId and kioskId.
+    """
+    event_id = payload.get("eventId") or f"evt_{uuid.uuid4().hex}"
+    payload["eventId"] = event_id
+    payload["kioskId"] = kiosk_id or DEVICE_ID
+
     with get_connection() as conn:
         cur = conn.execute("""
-            INSERT INTO outbox_events (event_type, job_id, payload_json, next_retry_at, backlog_status)
-            VALUES (?, ?, ?, CURRENT_TIMESTAMP, 'pending')
-        """, (event_type, job_id, json.dumps(payload)))
+            INSERT INTO outbox_events (
+                event_id, kiosk_id, event_type, job_id, payload_json,
+                next_retry_at, backlog_status, error_category
+            ) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 'pending', 'none')
+        """, (event_id, kiosk_id or DEVICE_ID, event_type, job_id, json.dumps(payload)))
         conn.commit()
         return cur.lastrowid or 0
 
 
-def get_pending_outbox(limit: int = 10) -> List[Dict[str, Any]]:
+def get_pending_outbox(limit: int = 10, due_only: bool = False) -> List[Dict[str, Any]]:
     """
-    Fetch events due for transmission.
-    Respects next_retry_at schedule. Does NOT drop events above 10 retries.
+    Fetch events pending transmission.
+    If due_only is True, filters where next_retry_at <= CURRENT_TIMESTAMP.
+    Never silently drops events.
     """
     with get_connection() as conn:
-        rows = conn.execute("""
-            SELECT * FROM outbox_events
-            WHERE synced = 0
-              AND (next_retry_at IS NULL OR next_retry_at <= CURRENT_TIMESTAMP)
-            ORDER BY created_at ASC
-            LIMIT ?
-        """, (limit,)).fetchall()
+        if due_only:
+            rows = conn.execute("""
+                SELECT * FROM outbox_events
+                WHERE synced = 0
+                  AND (next_retry_at IS NULL OR next_retry_at <= CURRENT_TIMESTAMP)
+                ORDER BY created_at ASC
+                LIMIT ?
+            """, (limit,)).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT * FROM outbox_events
+                WHERE synced = 0
+                ORDER BY created_at ASC
+                LIMIT ?
+            """, (limit,)).fetchall()
         return [dict(r) for r in rows]
 
 
-def mark_outbox_synced(event_id: int) -> None:
+def mark_outbox_synced(event_id_or_row_id: Any) -> None:
+    """Mark an event confirmed acknowledged by the cloud backend."""
+    if isinstance(event_id_or_row_id, (tuple, list)):
+        event_id_or_row_id = event_id_or_row_id[0]
     with get_connection() as conn:
-        conn.execute("""
-            UPDATE outbox_events
-            SET synced = 1, backlog_status = 'synced', synced_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-        """, (event_id,))
+        if isinstance(event_id_or_row_id, int):
+            conn.execute("""
+                UPDATE outbox_events
+                SET synced = 1, backlog_status = 'synced', synced_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (event_id_or_row_id,))
+        else:
+            conn.execute("""
+                UPDATE outbox_events
+                SET synced = 1, backlog_status = 'synced', synced_at = CURRENT_TIMESTAMP
+                WHERE event_id = ?
+            """, (str(event_id_or_row_id),))
         conn.commit()
 
 
-def schedule_outbox_retry(event_id: int, error: str) -> None:
+def schedule_outbox_retry(
+    event_id_or_row_id: Any,
+    error: str,
+    status_code: Optional[int] = None,
+) -> None:
     """
-    Record error and schedule next retry using exponential backoff.
-    Never deletes or drops the event.
+    Classify error and schedule next retry using jittered exponential backoff.
+    Never abandons events.
     """
+    if isinstance(event_id_or_row_id, (tuple, list)):
+        event_id_or_row_id = event_id_or_row_id[0]
+    category = "network_error"
+    if status_code == 401 or status_code == 403:
+        category = "auth_error"
+    elif status_code == 400 or status_code == 422:
+        category = "validation_error"
+    elif status_code == 404:
+        category = "not_found"
+    elif status_code == 409:
+        category = "conflict"
+    elif status_code and status_code >= 500:
+        category = "server_error"
+
     with get_connection() as conn:
-        row = conn.execute("SELECT retry_count FROM outbox_events WHERE id = ?", (event_id,)).fetchone()
+        field = "id" if isinstance(event_id_or_row_id, int) else "event_id"
+        row = conn.execute(f"SELECT retry_count FROM outbox_events WHERE {field} = ?", (event_id_or_row_id,)).fetchone()
         count = (row["retry_count"] if row else 0) + 1
-        # Exponential backoff: 5s, 10s, 20s, 40s, 80s, 160s, max 1800s (30m)
-        backoff_sec = min(1800, 5 * (2 ** min(count, 8)))
+
+        # Exponential backoff with random jitter: (5 * 2^min(count, 8)) + jitter(1-5s)
+        base_backoff = min(1800, 5 * (2 ** min(count, 8)))
+        backoff_sec = base_backoff + random.randint(1, 5)
+
         status = "retrying" if count < 10 else "failed_needs_attention"
 
-        conn.execute("""
+        conn.execute(f"""
             UPDATE outbox_events
             SET retry_count = ?,
                 last_error = ?,
+                error_category = ?,
                 backlog_status = ?,
                 next_retry_at = datetime('now', ? || ' seconds')
-            WHERE id = ?
-        """, (count, error[:300], status, str(backoff_sec), event_id))
+            WHERE {field} = ?
+        """, (count, error[:300], category, status, str(backoff_sec), event_id_or_row_id))
         conn.commit()
 
 
 def get_outbox_stats() -> Dict[str, int]:
-    """Return counts for telemetry visibility."""
+    """Return counts for telemetry visibility in admin control centre."""
     with get_connection() as conn:
         total_pending = conn.execute("SELECT count(*) FROM outbox_events WHERE synced = 0").fetchone()[0]
-        failed_attention = conn.execute("SELECT count(*) FROM outbox_events WHERE synced = 0 AND retry_count >= 10").fetchone()[0]
+        failed_attention = conn.execute(
+            "SELECT count(*) FROM outbox_events WHERE synced = 0 AND (retry_count >= 10 OR backlog_status = 'failed_needs_attention')"
+        ).fetchone()[0]
         total_synced = conn.execute("SELECT count(*) FROM outbox_events WHERE synced = 1").fetchone()[0]
         return {
             "pending_events": total_pending,

@@ -39,7 +39,7 @@ def test_token_matches_canonical_hmac(dev_env):
     secret = os.environ["DEVICE_AUTH_SECRET"].encode("utf-8")
 
     body_sha256 = hashlib.sha256(body).hexdigest()
-    canonical_msg = f"{device_id}:{ts}:{nonce}:{body_sha256}".encode("utf-8")
+    canonical_msg = auth.build_canonical_message("POST", "", ts, nonce, body_sha256).encode("utf-8")
     expected = hmac.new(secret, canonical_msg, hashlib.sha256).hexdigest()
 
     assert token == expected
@@ -60,7 +60,7 @@ def test_validate_incoming_token(dev_env, fresh_db):
     # Different nonce to avoid replay check
     fresh_nonce = "fresh-test-nonce-12345"
     body_sha = hashlib.sha256(body).hexdigest()
-    msg = f"{headers['x-device-id']}:{headers['x-device-ts']}:{fresh_nonce}:{body_sha}".encode("utf-8")
+    msg = auth.build_canonical_message("POST", "", headers["x-device-ts"], fresh_nonce, body_sha).encode("utf-8")
     secret = os.environ["DEVICE_AUTH_SECRET"].encode("utf-8")
     token = hmac.new(secret, msg, hashlib.sha256).hexdigest()
 

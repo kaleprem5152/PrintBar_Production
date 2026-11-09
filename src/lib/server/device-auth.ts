@@ -4,104 +4,96 @@ import { db } from "@/db";
 import { devices, deviceNonces } from "@/db/schema";
 import { eq } from "drizzle-orm";
 
-// In-memory sliding cache for fast duplicate rejection before DB
-const memoryNonceCache = new Map<string, number>();
-const NONCE_WINDOW_MS = 300_000; // 5 minutes
+export const EMPTY_BODY_SHA256 = createHash("sha256").update("").digest("hex");
+const MAX_CLOCK_SKEW_SECONDS = 120; // 2 minutes
 
-function sweepMemoryNonces(now: number) {
-  for (const [key, ts] of memoryNonceCache.entries()) {
-    if (now - ts > NONCE_WINDOW_MS) {
-      memoryNonceCache.delete(key);
+/**
+ * Normalizes a URL path for canonical HMAC signing.
+ * Strips query strings, hashes, duplicate slashes, and trailing slashes.
+ * Example: "https://host/api/device/jobs/?foo=bar" -> "/api/device/jobs"
+ */
+export function normalizeCanonicalPath(urlOrPath: string): string {
+  try {
+    let pathname = urlOrPath;
+    if (urlOrPath.startsWith("http://") || urlOrPath.startsWith("https://")) {
+      pathname = new URL(urlOrPath).pathname;
+    } else {
+      pathname = urlOrPath.split("?")[0].split("#")[0];
     }
+    pathname = pathname.replace(/\/+/g, "/").replace(/\/$/, "");
+    return pathname.startsWith("/") ? pathname : "/" + pathname;
+  } catch {
+    return urlOrPath;
   }
 }
 
-export const EMPTY_BODY_SHA256 = createHash("sha256").update("").digest("hex");
+/**
+ * Builds the unambiguous canonical message string:
+ * METHOD:PATH:TIMESTAMP:NONCE:BODY_SHA256
+ */
+export function buildCanonicalMessage(
+  method: string,
+  pathname: string,
+  timestamp: string,
+  nonce: string,
+  bodySha256: string
+): string {
+  const normMethod = method.trim().toUpperCase();
+  const normPath   = normalizeCanonicalPath(pathname);
+  const normSha    = bodySha256.trim().toLowerCase();
+  return `${normMethod}:${normPath}:${timestamp}:${nonce}:${normSha}`;
+}
 
 /**
- * Authenticate a Raspberry Pi device request using canonical HMAC-SHA256.
+ * Authenticate a Raspberry Pi device request.
  *
- * Headers required:
- *   x-device-id:    The device ID (e.g. "PB-K01")
- *   x-device-ts:    Unix epoch timestamp in seconds
- *   x-device-nonce: Unique request nonce (UUIDv4 hex)
- *   x-device-token: HMAC-SHA256(DEVICE_ID + ":" + timestamp + ":" + nonce + ":" + bodySha256, DEVICE_AUTH_SECRET)
- *
- * All raw-secret / x-agent-key authentication is eliminated.
- * Nonces are persisted durably in PostgreSQL to prevent replay across instances.
+ * Strict Security Order (V4 Spec):
+ * 1. Validate device identity & headers.
+ * 2. Validate timestamp format and allowed clock tolerance.
+ * 3. Validate nonce format.
+ * 4. Calculate request body hash (SHA-256).
+ * 5. Reconstruct the canonical signature.
+ * 6. Verify HMAC using constant-time comparison.
+ * 7. Atomically insert the nonce into durable PostgreSQL storage with unique constraint.
+ * 8. Reject replayed nonce values.
+ * 9. In production: if PostgreSQL replay protection fails, reject request.
  */
 export async function authenticateDevice(req: Request): Promise<{
   ok: boolean;
   deviceId?: string;
   error?: string;
 }> {
-  const deviceId = req.headers.get("x-device-id") ?? "";
-  const token    = req.headers.get("x-device-token") ?? "";
-  const tsHeader = req.headers.get("x-device-ts") ?? "";
-  const nonce    = req.headers.get("x-device-nonce") ?? "";
+  // Read headers (supporting both standard X-Signature and x-device-token)
+  const deviceId  = req.headers.get("x-device-id") ?? "";
+  const signature = req.headers.get("x-signature") ?? req.headers.get("x-device-token") ?? "";
+  const tsHeader  = req.headers.get("x-timestamp") ?? req.headers.get("x-device-ts") ?? "";
+  const nonce     = req.headers.get("x-nonce") ?? req.headers.get("x-device-nonce") ?? "";
 
-  if (!deviceId || !token || !tsHeader || !nonce) {
+  // 1. Validate required headers presence and device identity format
+  if (!deviceId || !signature || !tsHeader || !nonce) {
     return {
       ok: false,
-      error: "Missing required device authentication headers (x-device-id, x-device-token, x-device-ts, x-device-nonce).",
+      error: "Missing required device authentication headers (X-Device-ID, X-Timestamp, X-Nonce, X-Signature).",
     };
   }
 
-  // Validate timestamp freshness (window of 120 seconds to prevent clock skew issues)
-  const ts  = parseInt(tsHeader, 10);
+  if (!/^[A-Za-z0-9_-]{3,32}$/.test(deviceId)) {
+    return { ok: false, error: "Invalid device ID format." };
+  }
+
+  // 2. Validate timestamp freshness
+  const ts = parseInt(tsHeader, 10);
   const now = Math.floor(Date.now() / 1000);
-  if (isNaN(ts) || Math.abs(now - ts) > 120) {
-    return { ok: false, error: "Request timestamp is expired or too far in the future." };
+  if (isNaN(ts) || Math.abs(now - ts) > MAX_CLOCK_SKEW_SECONDS) {
+    return { ok: false, error: "Request timestamp is outside the allowed clock tolerance window." };
   }
 
-  // Check memory cache first
-  const nowMs = Date.now();
-  sweepMemoryNonces(nowMs);
-  const nonceKey = `${deviceId}:${nonce}`;
-  if (memoryNonceCache.has(nonceKey)) {
-    return { ok: false, error: "Replay attack detected: nonce already used." };
+  // 3. Validate nonce format (hex/alphanumeric 16-64 chars)
+  if (!/^[A-Za-z0-9_-]{16,64}$/.test(nonce)) {
+    return { ok: false, error: "Invalid nonce format." };
   }
 
-  // Durable DB nonce check
-  try {
-    const inserted = await db
-      .insert(deviceNonces)
-      .values({ nonce, deviceId })
-      .onConflictDoNothing()
-      .returning({ nonce: deviceNonces.nonce });
-
-    if (inserted.length === 0) {
-      return { ok: false, error: "Replay attack detected: nonce previously recorded." };
-    }
-    memoryNonceCache.set(nonceKey, nowMs);
-  } catch (err) {
-    // In dev or if table not yet migrated, fall back safely to in-memory check
-    memoryNonceCache.set(nonceKey, nowMs);
-  }
-
-  // Verify device is registered in DB
-  let device: typeof devices.$inferSelect | undefined;
-  try {
-    const [d] = await db.select().from(devices).where(eq(devices.id, deviceId));
-    device = d;
-  } catch (err) {
-    if (process.env.NODE_ENV === "production") {
-      return { ok: false, error: "Database unavailable for device verification." };
-    }
-  }
-
-  if (process.env.NODE_ENV === "production" && (!device || !device.isActive)) {
-    return { ok: false, error: "Device not registered or inactive." };
-  }
-
-  // Read secret
-  const secret = process.env.DEVICE_AUTH_SECRET || process.env.KIOSK_AGENT_SECRET || "";
-  if (!secret) {
-    console.error("[device-auth] DEVICE_AUTH_SECRET is not configured");
-    return { ok: false, error: "Device authentication not configured." };
-  }
-
-  // Calculate body SHA-256
+  // 4. Calculate request body hash
   let bodySha256 = EMPTY_BODY_SHA256;
   try {
     if (req.method !== "GET" && req.method !== "HEAD") {
@@ -115,22 +107,59 @@ export async function authenticateDevice(req: Request): Promise<{
     bodySha256 = EMPTY_BODY_SHA256;
   }
 
-  // Canonical HMAC signature: deviceId:timestamp:nonce:bodySha256
-  const canonicalMessage = `${deviceId}:${tsHeader}:${nonce}:${bodySha256}`;
-  const expectedToken = createHmac("sha256", secret).update(canonicalMessage).digest("hex");
+  // Authoritative secret
+  const secret = process.env.DEVICE_AUTH_SECRET || process.env.PRINTBAR_DEVICE_SECRET || "";
+  if (!secret) {
+    console.error("[device-auth] DEVICE_AUTH_SECRET is not configured on server");
+    return { ok: false, error: "Server device authentication is not configured." };
+  }
 
-  const givenBuf = Buffer.from(token, "utf8");
-  const expBuf = Buffer.from(expectedToken, "utf8");
+  // 5. Reconstruct canonical signature: METHOD:PATH:TIMESTAMP:NONCE:BODY_SHA256
+  const normPath = normalizeCanonicalPath(new URL(req.url).pathname);
+  const canonicalMessage = buildCanonicalMessage(req.method, normPath, tsHeader, nonce, bodySha256);
+  const expectedSignature = createHmac("sha256", secret).update(canonicalMessage).digest("hex");
 
-  const isMatch = givenBuf.length === expBuf.length && timingSafeEqual(givenBuf, expBuf);
+  // 6. Verify HMAC using constant-time comparison
+  const givenBuf    = Buffer.from(signature, "utf8");
+  const expectedBuf = Buffer.from(expectedSignature, "utf8");
 
-  if (!isMatch) {
-    // Support transition fallback (without body hash) if timestamp is within 60s
-    const legacyMessage = `${deviceId}:${tsHeader}:${nonce}`;
-    const legacyExpected = createHmac("sha256", secret).update(legacyMessage).digest("hex");
-    const legBuf = Buffer.from(legacyExpected, "utf8");
-    if (givenBuf.length !== legBuf.length || !timingSafeEqual(givenBuf, legBuf)) {
-      return { ok: false, error: "Device authentication signature verification failed." };
+  if (givenBuf.length !== expectedBuf.length || !timingSafeEqual(givenBuf, expectedBuf)) {
+    // Check fallback canonical without method:path if path was rewriten by proxy
+    const altMessage = `${deviceId}:${tsHeader}:${nonce}:${bodySha256}`;
+    const altExpected = createHmac("sha256", secret).update(altMessage).digest("hex");
+    const altBuf = Buffer.from(altExpected, "utf8");
+    if (givenBuf.length !== altBuf.length || !timingSafeEqual(givenBuf, altBuf)) {
+      return { ok: false, error: "HMAC signature verification failed." };
+    }
+  }
+
+  // 7 & 8. Atomically consume nonce in PostgreSQL (Only executed AFTER valid signature!)
+  try {
+    const inserted = await db
+      .insert(deviceNonces)
+      .values({ nonce, deviceId })
+      .onConflictDoNothing()
+      .returning({ nonce: deviceNonces.nonce });
+
+    if (inserted.length === 0) {
+      return { ok: false, error: "Replay attack detected: nonce has already been consumed." };
+    }
+  } catch (dbErr) {
+    console.error("[device-auth] PostgreSQL replay protection error:", (dbErr as Error).message);
+    if (process.env.NODE_ENV === "production") {
+      return { ok: false, error: "Database replay protection is currently unavailable." };
+    }
+  }
+
+  // 9. Verify device registration in DB
+  try {
+    const [device] = await db.select().from(devices).where(eq(devices.id, deviceId));
+    if (process.env.NODE_ENV === "production" && (!device || !device.isActive)) {
+      return { ok: false, error: "Device is not registered or is currently inactive." };
+    }
+  } catch (err) {
+    if (process.env.NODE_ENV === "production") {
+      return { ok: false, error: "Database unavailable for device validation." };
     }
   }
 

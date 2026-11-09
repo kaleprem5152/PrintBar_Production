@@ -1,18 +1,29 @@
 [Unit]
-Description=PrintBar Hardware & CUPS Print Agent
+Description=PrintBar Hardware & CUPS Daemon (PB-K01)
 After=network-online.target cups.service
 Wants=network-online.target cups.service
+Requires=cups.service
 
 [Service]
 Type=simple
-User=pi
-WorkingDirectory=/home/pi/printbar-agent
+User=printbar
+Group=printbar
+WorkingDirectory=/opt/printbar/agent
+EnvironmentFile=/etc/printbar/printbar.env
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/home/pi/printbar-agent/venv/bin/python agent.py
-Restart=always
-RestartSec=5
+Environment=PYTHONPATH=/opt/printbar/agent
+ExecStart=/opt/printbar/venv/bin/python -u /opt/printbar/agent/agent.py
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=120
+StartLimitBurst=5
 StandardOutput=journal
 StandardError=journal
+SyslogIdentifier=printbar-agent
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/printbar
+PrivateTmp=yes
 
 [Install]
 WantedBy=multi-user.target

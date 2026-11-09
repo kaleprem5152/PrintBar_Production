@@ -1,22 +1,25 @@
 """
-PrintBar Printer Monitor — Production IPP + CUPS status module.
+PrintBar Printer Monitor — Production IPP + CUPS + SNMP status module.
 
 Provides unified printer state classification for Kyocera ECOSYS PA3500x
 and Canon MAXIFY GX6170 using:
   1. CUPS local queue readiness (MANDATORY — missing queue is never ready)
   2. IPP attribute query over HTTP/IPP (RFC 8011)
-  3. TCP reachability probe (ports 631 and 9100)
+  3. Optional SNMP Printer-MIB (RFC 3805) query
+  4. TCP reachability probe (ports 631 and 9100)
 
 States: READY | PRINTING | WARNING | PAPER_OUT | PAPER_JAM |
         COVER_OPEN | OFFLINE | DISABLED | ERROR | UNKNOWN
 
 STRICT RULES:
-- A missing CUPS queue is NEVER considered ready, even if network IPP responds.
+- A missing or disabled CUPS queue is NEVER ready, even if network IPP responds.
 - No fabricated toner or paper percentages. If hardware doesn't report it, state is None / "unsupported".
+- Freshness tracking: includes last_successful_check, source, and error details.
 """
 import socket
 import subprocess
 import re
+import time
 import logging
 import struct
 import importlib
@@ -24,9 +27,6 @@ from typing import Dict, Any, Optional, Tuple
 
 logger = logging.getLogger("printbar.monitor")
 
-# ---------------------------------------------------------------------------
-# State constants
-# ---------------------------------------------------------------------------
 STATE_READY      = "READY"
 STATE_PRINTING   = "PRINTING"
 STATE_WARNING    = "WARNING"
@@ -38,12 +38,10 @@ STATE_DISABLED   = "DISABLED"
 STATE_ERROR      = "ERROR"
 STATE_UNKNOWN    = "UNKNOWN"
 
-# IPP state codes (RFC 8011)
 _IPP_STATE_IDLE       = 3
 _IPP_STATE_PROCESSING = 4
 _IPP_STATE_STOPPED    = 5
 
-# IPP state-reasons mapping
 _REASON_MAP = {
     "media-empty":               STATE_PAPER_OUT,
     "media-needed":              STATE_PAPER_OUT,
@@ -81,12 +79,10 @@ class PrinterMonitor:
         self.kyocera_queue = kyocera_queue
         self.canon_queue   = canon_queue
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+        self.last_check_times: Dict[str, float] = {}
+        self.last_successful_times: Dict[str, float] = {}
 
     def get_all_printer_status(self) -> Dict[str, Dict[str, Any]]:
-        """Return status for both printers keyed by printer ID."""
         return {
             "kyocera": self.get_unified_status("kyocera", self.kyocera_ip, self.kyocera_queue),
             "canon":   self.get_unified_status("canon",   self.canon_ip,   self.canon_queue),
@@ -94,10 +90,13 @@ class PrinterMonitor:
 
     def get_unified_status(self, printer_id: str, ip: str, queue: str) -> Dict[str, Any]:
         """
-        Determine printer state using CUPS + Network IPP in priority order.
+        Determine printer state using CUPS + Network IPP + SNMP in priority order.
         Strict: If local CUPS queue is missing or disabled, the printer cannot print,
         so it is NEVER marked READY regardless of IPP responses.
         """
+        now = time.time()
+        self.last_check_times[printer_id] = now
+
         result: Dict[str, Any] = {
             "printer_id":  printer_id,
             "queue":       queue,
@@ -108,8 +107,11 @@ class PrinterMonitor:
             "reachable":   False,
             "cups_state":  None,
             "ipp_state":   None,
-            "toner_pct":   None,  # None means unsupported/unreported
+            "snmp_status": "unsupported",
+            "toner_pct":   None,  # Honest: None = unsupported/unreported
             "markers":     {},
+            "last_checked_at": time.strftime("%Y-%m-%d %H:%M:%S IST", time.localtime(now)),
+            "last_successful_at": None,
         }
 
         # 1. CUPS queue check (primary requirement for printing)
@@ -160,13 +162,14 @@ class PrinterMonitor:
                     result["toner_pct"] = result["markers"]["toner"]
 
                 derived = self._classify_ipp(ipp_info)
-                # Only trust IPP if CUPS queue is also healthy
                 if derived in (STATE_PAPER_OUT, STATE_PAPER_JAM, STATE_COVER_OPEN, STATE_WARNING):
                     result.update(
                         state=derived,
                         source="ipp",
                         reason=ipp_info.get("printer_state_reasons", ""),
                     )
+                    self.last_successful_times[printer_id] = now
+                    result["last_successful_at"] = time.strftime("%Y-%m-%d %H:%M:%S IST", time.localtime(now))
                     return result
                 elif derived in (STATE_READY, STATE_PRINTING) and cups_info.get("state") in ("idle", "processing"):
                     result.update(
@@ -174,13 +177,27 @@ class PrinterMonitor:
                         source="ipp+cups",
                         reason=ipp_info.get("printer_state_reasons", ""),
                     )
+                    self.last_successful_times[printer_id] = now
+                    result["last_successful_at"] = time.strftime("%Y-%m-%d %H:%M:%S IST", time.localtime(now))
                     return result
 
-        # 4. Fall back to CUPS state interpretation
+        # 4. SNMP query (optional read-only check on LAN)
+        if ip and result["reachable"]:
+            snmp_info = self._check_snmp(ip)
+            if snmp_info.get("supported"):
+                result["snmp_status"] = "active"
+                if snmp_info.get("toner_pct") is not None:
+                    result["toner_pct"] = snmp_info.get("toner_pct")
+
+        # 5. Fall back to CUPS state interpretation
         if cups_info.get("state") == "idle":
             result.update(state=STATE_READY, source="cups", reason="")
+            self.last_successful_times[printer_id] = now
+            result["last_successful_at"] = time.strftime("%Y-%m-%d %H:%M:%S IST", time.localtime(now))
         elif cups_info.get("state") == "processing":
             result.update(state=STATE_PRINTING, source="cups", reason="")
+            self.last_successful_times[printer_id] = now
+            result["last_successful_at"] = time.strftime("%Y-%m-%d %H:%M:%S IST", time.localtime(now))
         else:
             result.update(
                 state=STATE_UNKNOWN,
@@ -197,7 +214,6 @@ class PrinterMonitor:
     def _check_cups_queue(self, queue: str) -> Dict[str, Any]:
         info: Dict[str, Any] = {"state": None, "reason": ""}
 
-        # Try PyCUPS first if available
         try:
             cups = importlib.import_module("cups")
             conn = cups.Connection()
@@ -215,7 +231,6 @@ class PrinterMonitor:
         except Exception:
             pass
 
-        # Fallback: lpstat
         try:
             res = subprocess.run(
                 ["lpstat", "-p", queue],
@@ -350,7 +365,7 @@ class PrinterMonitor:
                 pos += name_len
                 if pos + 2 > len(body):
                     break
-                val_len = struct.unpack(">H", body[pos : pos + 2])[0]
+                val_len = struct.unpack(">H", body[pos : pos + val_len])[0]
                 pos += 2
                 value = body[pos : pos + val_len]
                 pos += val_len
@@ -384,10 +399,45 @@ class PrinterMonitor:
 
         return STATE_UNKNOWN
 
+    # ------------------------------------------------------------------
+    # SNMP Monitoring (Read-only query on LAN where supported)
+    # ------------------------------------------------------------------
+
+    def _check_snmp(self, ip: str, community: str = "public") -> Dict[str, Any]:
+        """
+        Check printer via SNMP Printer-MIB (RFC 3805) if snmpget CLI is available.
+        Never fabricates values if unavailable.
+        """
+        info: Dict[str, Any] = {"supported": False, "toner_pct": None}
+        try:
+            # Query standard Printer-MIB hrDeviceStatus (1.3.6.1.2.1.25.3.2.1.5.1)
+            res = subprocess.run(
+                ["snmpget", "-v2c", "-c", community, "-t", "2", "-r", "1", ip, "1.3.6.1.2.1.25.3.2.1.5.1"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            if res.returncode == 0:
+                info["supported"] = True
+                # Query marker supply level (1.3.6.1.2.1.43.11.1.1.9.1.1) and max (1.3.6.1.2.1.43.11.1.1.8.1.1)
+                res_lvl = subprocess.run(
+                    ["snmpget", "-v2c", "-c", community, "-t", "2", ip, "1.3.6.1.2.1.43.11.1.1.9.1.1", "1.3.6.1.2.1.43.11.1.1.8.1.1"],
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                )
+                if res_lvl.returncode == 0:
+                    nums = [int(s) for s in re.findall(r"INTEGER:\s*(-?\d+)", res_lvl.stdout)]
+                    if len(nums) >= 2 and nums[1] > 0 and nums[0] >= 0:
+                        info["toner_pct"] = max(0, min(100, round((nums[0] / nums[1]) * 100)))
+        except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
+            pass
+        return info
+
     def is_printer_ready(self, printer_id: str) -> Tuple[bool, str]:
         """
         Returns (ready: bool, reason: str).
-        A printer is ready ONLY IF its CUPS queue is present, active,
+        A printer is ready ONLY IF its local CUPS queue is present, active,
         and its state is READY or PRINTING.
         """
         ip = self.kyocera_ip if printer_id == "kyocera" else self.canon_ip

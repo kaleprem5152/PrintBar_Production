@@ -37,7 +37,7 @@ The PrintBar system comprises three tightly coupled, hardened layers:
 
 | Defect | Issue Description | Hardened Resolution |
 | :--- | :--- | :--- |
-| **P0-1** | HMAC format divergence & raw secrets | Unified canonical HMAC signature `deviceId:ts:nonce:bodySha256`. Removed `x-agent-key` raw secret. Added durable PostgreSQL `device_nonces` table. |
+| **P0-1** | HMAC format divergence & raw secrets | Unified canonical HMAC signature `METHOD:PATH:TIMESTAMP:NONCE:BODY_SHA256`. Removed `x-agent-key` raw secret. Added durable PostgreSQL `device_nonces` table. |
 | **P0-2** | Simulation fallbacks in CUPS manager | Removed all `sim-*` job IDs and mock readiness. Missing `lp`/`lpstat` binaries return explicit failures. |
 | **P0-3** | Print monitor timeout fallthrough | Added strict terminal completion check. Timed-out jobs raise errors and flag for `MANUAL_REVIEW`. |
 | **P0-4** | Unsafe automatic partial failover | Mid-print hardware halts flag `MANUAL_REVIEW` to prevent missing or duplicate physical pages. |

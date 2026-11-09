@@ -1,43 +1,79 @@
 """
 Authentication helper for the PrintBar Raspberry Pi Agent.
 Generates canonical HMAC-SHA256 request headers matching Next.js device-auth.
-Canonical message format: f"{DEVICE_ID}:{timestamp}:{nonce}:{body_sha256}"
 
-All raw secrets (x-agent-key) are completely eliminated.
-Includes durable nonce storage for replay protection.
+Canonical signature serialization:
+  f"{METHOD.upper()}:{NORMALIZED_PATH}:{TIMESTAMP}:{NONCE}:{BODY_SHA256}"
+
+Headers emitted:
+  X-Device-ID:   Device identifier (e.g. PB-K01)
+  X-Timestamp:   Unix epoch in seconds
+  X-Nonce:       Random UUIDv4 hex string
+  X-Signature:   HMAC-SHA256 hex string
+
+No raw long-lived secrets are ever transmitted in request headers.
 """
 import time
 import uuid
 import hmac
 import hashlib
 import logging
-from typing import Dict
+from typing import Dict, Optional
+from urllib.parse import urlparse
 from config import DEVICE_ID, DEVICE_AUTH_SECRET
 
 logger = logging.getLogger("printbar.auth")
 
-# Timestamp skew tolerance in seconds
 _MAX_SKEW_SECONDS = 120
+_EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 
 
-def get_auth_headers(body_bytes: bytes = b"") -> Dict[str, str]:
+def normalize_canonical_path(url_or_path: str) -> str:
+    """Extract and normalize path without query strings or trailing slashes."""
+    try:
+        if "://" in url_or_path:
+            parsed = urlparse(url_or_path)
+            path = parsed.path
+        else:
+            path = url_or_path.split("?")[0].split("#")[0]
+        # Normalize slashes
+        path = "/" + "/".join(part for part in path.split("/") if part)
+        return path if path != "/" else ""
+    except Exception:
+        return url_or_path
+
+
+def build_canonical_message(
+    method: str,
+    path: str,
+    timestamp: str,
+    nonce: str,
+    body_sha256: str,
+) -> str:
+    norm_method = method.strip().upper()
+    norm_path = normalize_canonical_path(path)
+    norm_sha = body_sha256.strip().lower()
+    return f"{norm_method}:{norm_path}:{timestamp}:{nonce}:{norm_sha}"
+
+
+def get_auth_headers(
+    body_bytes: bytes = b"",
+    method: str = "POST",
+    path: str = "",
+) -> Dict[str, str]:
     """
-    Generate device authentication headers for a cloud API request.
-
-    Canonical signature contract:
-      x-device-id    — Device identifier (e.g. PB-K01)
-      x-device-ts    — Unix epoch timestamp (seconds)
-      x-device-nonce — Random UUIDv4 hex (unique per request)
-      x-device-token — HMAC-SHA256 of "DEVICE_ID:ts:nonce:body_sha256"
+    Generate device authentication headers according to the canonical V4 specification.
     """
     ts = str(int(time.time()))
     nonce = uuid.uuid4().hex
-    body_hash = hashlib.sha256(body_bytes).hexdigest()
-    message = f"{DEVICE_ID}:{ts}:{nonce}:{body_hash}".encode("utf-8")
-    secret = DEVICE_AUTH_SECRET.encode("utf-8")
-    signature = hmac.new(secret, message, hashlib.sha256).hexdigest()
 
-    # Persist nonce to SQLite for local replay protection
+    body_sha256 = hashlib.sha256(body_bytes).hexdigest() if body_bytes else _EMPTY_SHA256
+    canonical_msg = build_canonical_message(method, path, ts, nonce, body_sha256).encode("utf-8")
+
+    secret = DEVICE_AUTH_SECRET.encode("utf-8")
+    signature = hmac.new(secret, canonical_msg, hashlib.sha256).hexdigest()
+
+    # Save nonce locally to prevent accidental re-submission
     try:
         import db as _db
         _db.save_nonce(nonce, DEVICE_ID)
@@ -45,6 +81,11 @@ def get_auth_headers(body_bytes: bytes = b"") -> Dict[str, str]:
         logger.debug("Could not persist nonce locally: %s", exc)
 
     return {
+        "X-Device-ID":    DEVICE_ID,
+        "X-Timestamp":    ts,
+        "X-Nonce":        nonce,
+        "X-Signature":    signature,
+        # Backward compatibility aliases
         "x-device-id":    DEVICE_ID,
         "x-device-ts":    ts,
         "x-device-nonce": nonce,
@@ -54,23 +95,41 @@ def get_auth_headers(body_bytes: bytes = b"") -> Dict[str, str]:
 
 
 def validate_incoming_token(
-    device_id: str,
-    ts_str: str,
-    nonce: str,
-    token: str,
-    body_bytes: bytes = b"",
+    *args,
+    **kwargs,
 ) -> bool:
     """
-    Validation helper verifying the canonical HMAC signature.
-    Returns True if the token is valid, timestamp is fresh, and nonce is not replayed.
+    Local validation helper matching the server contract.
+    Canonical signature: METHOD:PATH:TIMESTAMP:NONCE:BODY_SHA256
+    Supports:
+      validate_incoming_token(method, path, device_id, ts_str, nonce, token, body_bytes=b"")
+      validate_incoming_token(device_id, ts_str, nonce, token, body_bytes=b"") [defaults method='POST', path='']
     """
+    if len(args) == 5:
+        method = "POST"
+        path = ""
+        device_id, ts_str, nonce, token, body_bytes = args
+    elif len(args) == 6:
+        method, path, device_id, ts_str, nonce, token = args
+        body_bytes = b""
+    elif len(args) >= 7:
+        method, path, device_id, ts_str, nonce, token, body_bytes = args[:7]
+    else:
+        method = kwargs.get("method", "POST")
+        path = kwargs.get("path", "")
+        device_id = kwargs.get("device_id", "")
+        ts_str = str(kwargs.get("ts_str") or kwargs.get("timestamp_str", ""))
+        nonce = kwargs.get("nonce", "")
+        token = kwargs.get("token", "")
+        body_bytes = kwargs.get("body_bytes", b"")
+
     try:
         ts = int(ts_str)
         skew = abs(int(time.time()) - ts)
         if skew > _MAX_SKEW_SECONDS:
             logger.warning("Token timestamp expired: skew=%ds", skew)
             return False
-    except ValueError:
+    except (ValueError, TypeError):
         return False
 
     try:
@@ -81,8 +140,8 @@ def validate_incoming_token(
     except Exception:
         pass
 
-    body_hash = hashlib.sha256(body_bytes).hexdigest()
-    message = f"{device_id}:{ts_str}:{nonce}:{body_hash}".encode("utf-8")
+    body_sha = hashlib.sha256(body_bytes).hexdigest() if body_bytes else _EMPTY_SHA256
+    canonical_msg = build_canonical_message(method, path, str(ts_str), nonce, body_sha).encode("utf-8")
     secret = DEVICE_AUTH_SECRET.encode("utf-8")
-    expected = hmac.new(secret, message, hashlib.sha256).hexdigest()
+    expected = hmac.new(secret, canonical_msg, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, token)

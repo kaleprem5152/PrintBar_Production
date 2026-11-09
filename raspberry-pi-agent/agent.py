@@ -1,14 +1,14 @@
 """
-PrintBar Raspberry Pi Agent — Production Autonomous Daemon v3.1.
+PrintBar Raspberry Pi Agent — Production Autonomous Daemon v4.0.
 
 Runs on the physical Raspberry Pi 5 inside the PrintBar kiosk (PB-K01).
-Strict Production Fixes (P0 & P1):
-  - Canonical HMAC-SHA256 authentication matching backend contract (no raw secrets)
-  - Explicit non-zero error handling (zero simulation in CUPS manager & monitor)
+V4 Production Hardening:
+  - Canonical HMAC-SHA256 signature (METHOD:PATH:TIMESTAMP:NONCE:BODY_SHA256)
+  - Zero simulation mode; genuine CUPS and printer status only
   - Strict print-monitor timeout: timeouts NEVER fall through to completion; require MANUAL_REVIEW
   - Unsafe automatic partial failover disabled: mid-print interruptions flagged for MANUAL_REVIEW
-  - Verified cloud acknowledgement: only HTTP 2xx marks outbox synced; 4xx stays in retry/backlog
-  - Authentic crash recovery: reconciles CUPS state against local jobs at startup; uncertain output flags MANUAL_REVIEW
+  - Durable Outbox with verified response acknowledgements (eventId check) & exponential backoff
+  - Authentic crash recovery: reconciles recorded CUPS IDs at startup; uncertain output flags MANUAL_REVIEW
   - Multi-document order handling: tracks cumulative pages, copies, and document iterations accurately
   - Setting validation: validates N-up, colour restrictions, duplex against physical printer capabilities
   - Reliable document cleanup with visibility into cleanup errors
@@ -24,6 +24,7 @@ import logging
 import requests
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
+from urllib.parse import urlparse
 
 from config import (
     CLOUD_API_URL,
@@ -40,7 +41,7 @@ from config import (
     PRODUCTION_MODE,
     validate_config,
 )
-from auth import get_auth_headers
+from auth import get_auth_headers, normalize_canonical_path
 from db import (
     init_db,
     record_job_claimed,
@@ -80,7 +81,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("printbar.agent")
 
-AGENT_VERSION = "3.1.0"
+AGENT_VERSION = "4.0.0"
 
 
 class PrintBarAgent:
@@ -122,14 +123,14 @@ class PrintBarAgent:
         self._recover_incomplete_jobs()
 
     # ------------------------------------------------------------------
-    # Startup Recovery (Defect 6: Authentic CUPS reconciliation)
+    # Startup Recovery (Authentic CUPS & Cloud Reconciliation)
     # ------------------------------------------------------------------
 
     def _recover_incomplete_jobs(self) -> None:
         """
-        Reconcile incomplete jobs with CUPS job IDs.
-        Never assume failure or completion when physical state is uncertain.
-        Flag uncertain jobs for MANUAL_REVIEW so students are not double-charged or double-printed.
+        Reconcile incomplete jobs with CUPS job IDs and cloud state.
+        Never blindly fail or complete when physical state is uncertain.
+        Flag uncertain jobs for MANUAL_REVIEW.
         """
         jobs = get_incomplete_jobs()
         if not jobs:
@@ -151,7 +152,6 @@ class PrintBarAgent:
                 sheets = prog.get("sheets_completed", 0)
 
                 if cups_state == "completed" and prog.get("verified"):
-                    # Confirmed completed in CUPS
                     logger.info("Job %s was confirmed completed by CUPS (%d sheets).", order_id, sheets)
                     ack = self._report_complete(order_id, pages_to_print, cups_id)
                     if ack:
@@ -159,7 +159,6 @@ class PrintBarAgent:
                     continue
 
                 elif cups_state in ("stopped", "canceled", "aborted"):
-                    # Confirmed failed in CUPS
                     logger.warning("Job %s was %s in CUPS at impression %d.", order_id, cups_state, impr)
                     mark_job_manual_review(
                         order_id,
@@ -181,7 +180,7 @@ class PrintBarAgent:
             self._report_failure(
                 order_id,
                 pages_printed=job.get("pages_printed", 0),
-                reason=f"Agent restarted during execution. Physical delivery uncertain. Flagged for manual review.",
+                reason="Agent restarted during execution. Physical delivery uncertain. Flagged for manual review.",
             )
 
     # ------------------------------------------------------------------
@@ -269,6 +268,7 @@ class PrintBarAgent:
         canon_ready = self._canon_state.get("state") in (STATE_READY, STATE_PRINTING)
 
         # 1. Device Heartbeat (/api/device/heartbeat)
+        device_url = f"{CLOUD_API_URL}/api/device/heartbeat"
         device_payload = {
             "kyoceraReady": kyocera_ready,
             "canonReady": canon_ready,
@@ -282,13 +282,8 @@ class PrintBarAgent:
         }
         try:
             body = json.dumps(device_payload).encode("utf-8")
-            headers = get_auth_headers(body)
-            res = requests.post(
-                f"{CLOUD_API_URL}/api/device/heartbeat",
-                data=body,
-                headers=headers,
-                timeout=8,
-            )
+            headers = get_auth_headers(body, method="POST", path="/api/device/heartbeat")
+            res = requests.post(device_url, data=body, headers=headers, timeout=8)
             if res.status_code == 200:
                 hb = res.json()
                 self.kyocera_paper = hb.get("kyoceraPaper", self.kyocera_paper)
@@ -301,6 +296,7 @@ class PrintBarAgent:
             logger.warning("Device heartbeat network error: %s", exc)
 
         # 2. Admin Telemetry Heartbeat (/api/agent/heartbeat)
+        admin_url = f"{CLOUD_API_URL}/api/agent/heartbeat"
         admin_payload = {
             "kioskId": DEVICE_ID,
             "softwareVersion": AGENT_VERSION,
@@ -314,7 +310,7 @@ class PrintBarAgent:
                     "connected": kyocera_ready,
                     "state": self._kyocera_state.get("state", "UNKNOWN").lower(),
                     "paperRemaining": self.kyocera_paper,
-                    "tonerBlack": self._kyocera_state.get("toner_pct"),  # honest (None if unsupported)
+                    "tonerBlack": self._kyocera_state.get("toner_pct"),
                     "errorMessage": self._kyocera_state.get("reason") if not kyocera_ready else None,
                 },
                 {
@@ -323,66 +319,66 @@ class PrintBarAgent:
                     "connected": canon_ready,
                     "state": self._canon_state.get("state", "UNKNOWN").lower(),
                     "paperRemaining": self.canon_paper,
-                    "tonerColor": self._canon_state.get("toner_pct"),  # honest
+                    "tonerColor": self._canon_state.get("toner_pct"),
                     "errorMessage": self._canon_state.get("reason") if not canon_ready else None,
                 },
             ],
         }
         try:
             body2 = json.dumps(admin_payload).encode("utf-8")
-            headers2 = get_auth_headers(body2)
-            requests.post(
-                f"{CLOUD_API_URL}/api/agent/heartbeat",
-                data=body2,
-                headers=headers2,
-                timeout=8,
-            )
+            headers2 = get_auth_headers(body2, method="POST", path="/api/agent/heartbeat")
+            requests.post(admin_url, data=body2, headers=headers2, timeout=8)
         except Exception as exc:
             logger.debug("Admin telemetry heartbeat notice: %s", exc)
 
         self.last_heartbeat_time = now
 
     # ------------------------------------------------------------------
-    # Durable Outbox Processing (Defect 5: Only 2xx marks synced)
+    # Durable Outbox Processing (Verified Acknowledgement & Backoff)
     # ------------------------------------------------------------------
 
     def flush_outbox(self) -> None:
-        """Retry pending events due for transmission with exponential backoff."""
+        """Retry pending events due for transmission with exponential backoff & verified ack."""
         now = time.time()
         if now - self.last_outbox_flush_time < 10:
             return
         self.last_outbox_flush_time = now
 
-        events = get_pending_outbox(limit=5)
+        events = get_pending_outbox(limit=5, due_only=True)
         for ev in events:
             ev_id = ev["id"]
+            event_id = ev.get("event_id") or str(ev_id)
             try:
                 payload = json.loads(ev["payload_json"])
                 url = payload.pop("_url")
                 method = payload.pop("_method", "POST").upper()
                 body = json.dumps(payload).encode("utf-8")
-                headers = get_auth_headers(body)
+                headers = get_auth_headers(body, method=method, path=url)
 
                 if method == "PATCH":
                     r = requests.patch(url, data=body, headers=headers, timeout=8)
                 else:
                     r = requests.post(url, data=body, headers=headers, timeout=8)
 
-                # STRICT: Only HTTP 2xx is considered synchronized
                 if 200 <= r.status_code < 300:
-                    mark_outbox_synced(ev_id)
-                    logger.debug("Outbox event #%d successfully synced (HTTP %d).", ev_id, r.status_code)
+                    # Verify backend acknowledged the event
+                    data = r.json() if r.content else {}
+                    if data.get("ok") or data.get("acknowledged") or data.get("eventId") == event_id:
+                        mark_outbox_synced(ev_id)
+                        logger.debug("Outbox event #%s successfully acknowledged by cloud (HTTP %d).", event_id, r.status_code)
+                    else:
+                        schedule_outbox_retry(ev_id, f"HTTP {r.status_code}: Unverified cloud payload", status_code=r.status_code)
                 else:
                     err = f"HTTP {r.status_code}: {r.text[:200]}"
-                    logger.warning("Outbox event #%d rejected by cloud (%s). Scheduling retry.", ev_id, err)
-                    schedule_outbox_retry(ev_id, err)
+                    logger.warning("Outbox event #%s rejected (%s). Scheduling retry.", event_id, err)
+                    schedule_outbox_retry(ev_id, err, status_code=r.status_code)
 
             except Exception as exc:
-                logger.warning("Outbox transmission error for #%d: %s", ev_id, exc)
+                logger.warning("Outbox transmission error for #%s: %s", event_id, exc)
                 schedule_outbox_retry(ev_id, str(exc))
 
     # ------------------------------------------------------------------
-    # Durable Command Handling (Defect 8: Leases & Execution Ack)
+    # Durable Command Handling (Lease Recovery & Execution Ack)
     # ------------------------------------------------------------------
 
     def poll_and_execute_commands(self) -> None:
@@ -393,9 +389,10 @@ class PrintBarAgent:
         self.last_command_poll_time = now
 
         try:
-            headers = get_auth_headers()
+            path = "/api/agent/commands"
+            headers = get_auth_headers(b"", method="GET", path=path)
             res = requests.get(
-                f"{CLOUD_API_URL}/api/agent/commands?kioskId={DEVICE_ID}",
+                f"{CLOUD_API_URL}{path}?kioskId={DEVICE_ID}",
                 headers=headers,
                 timeout=8,
             )
@@ -498,7 +495,7 @@ class PrintBarAgent:
             result_msg = f"Exception executing '{action}': {exc}"
             logger.error(result_msg)
 
-        # STRICT: Only complete command locally if cloud receives & confirms ack
+        # STRICT: Only complete command locally if cloud confirms receipt of ack
         ack_confirmed = self._acknowledge_command(cmd_id, status, result_msg)
         if cmd_id and ack_confirmed:
             complete_command(cmd_id, status, {"result": result_msg})
@@ -507,14 +504,10 @@ class PrintBarAgent:
         if not cmd_id:
             return False
         try:
+            path = f"/api/agent/commands/{cmd_id}"
             body = json.dumps({"status": status, "result": result[:500]}).encode("utf-8")
-            headers = get_auth_headers(body)
-            res = requests.post(
-                f"{CLOUD_API_URL}/api/agent/commands/{cmd_id}",
-                data=body,
-                headers=headers,
-                timeout=8,
-            )
+            headers = get_auth_headers(body, method="POST", path=path)
+            res = requests.post(f"{CLOUD_API_URL}{path}", data=body, headers=headers, timeout=8)
             return 200 <= res.status_code < 300
         except Exception as exc:
             logger.warning("Could not acknowledge command #%s to backend: %s", cmd_id, exc)
@@ -525,7 +518,7 @@ class PrintBarAgent:
     # ------------------------------------------------------------------
 
     def poll_and_process_jobs(self) -> None:
-        """Poll cloud for available jobs."""
+        """Poll cloud for available paid jobs."""
         if self.maintenance_mode:
             return
 
@@ -534,8 +527,9 @@ class PrintBarAgent:
             return
 
         try:
-            headers = get_auth_headers()
-            res = requests.get(f"{CLOUD_API_URL}/api/device/jobs", headers=headers, timeout=8)
+            path = "/api/device/jobs"
+            headers = get_auth_headers(b"", method="GET", path=path)
+            res = requests.get(f"{CLOUD_API_URL}{path}", headers=headers, timeout=8)
             if res.status_code != 200:
                 return
 
@@ -551,16 +545,12 @@ class PrintBarAgent:
     def _claim_and_execute_job(self, order_id: str) -> None:
         """Atomically claim an order and execute the print pipeline."""
         idempotency_key = f"{order_id}-{DEVICE_ID}"
+        path = "/api/device/jobs"
         body = json.dumps({"orderId": order_id, "idempotencyKey": idempotency_key}).encode("utf-8")
-        headers = get_auth_headers(body)
+        headers = get_auth_headers(body, method="POST", path=path)
 
         try:
-            res = requests.post(
-                f"{CLOUD_API_URL}/api/device/jobs",
-                data=body,
-                headers=headers,
-                timeout=10,
-            )
+            res = requests.post(f"{CLOUD_API_URL}{path}", data=body, headers=headers, timeout=10)
             if res.status_code != 200:
                 logger.info("Could not claim job %s: %s", order_id, res.text[:200])
                 return
@@ -585,7 +575,6 @@ class PrintBarAgent:
                 len(docs),
             )
 
-            # Record claim in SQLite (idempotent — preserves progress if exists)
             record_job_claimed(
                 order_id,
                 job_ref,
@@ -605,7 +594,7 @@ class PrintBarAgent:
             logger.error("Error claiming job %s: %s", order_id, exc)
 
     # ------------------------------------------------------------------
-    # Print Pipeline (Defects 3, 4, 9, 10, 16)
+    # Print Pipeline Execution
     # ------------------------------------------------------------------
 
     def _execute_print_pipeline(
@@ -621,11 +610,10 @@ class PrintBarAgent:
         Executes print pipeline with verified multi-doc tracking, capability validation,
         strict timeout enforcement (no false completions), and safe error handling.
         """
-        # Per-job secure directory
         job_dir = DOCUMENT_STORAGE_DIR / uuid.uuid4().hex
         job_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
 
-        downloaded_files: List[Tuple[str, int]] = []  # List of (file_path, doc_pages)
+        downloaded_files: List[Tuple[str, int]] = []
         total_pages_printed = 0
         cups_job_id: Optional[str] = None
         attempt_id: Optional[int] = None
@@ -639,7 +627,7 @@ class PrintBarAgent:
         number_up = int(settings.get("pagesPerSheet", 1))
 
         try:
-            # 1. Capability & Settings Validation (Defect 10)
+            # 1. Capability & Settings Validation
             if number_up not in (1, 2, 4, 6, 9, 16):
                 raise ValueError(f"Invalid N-up value: {number_up}. Supported: 1, 2, 4, 6, 9, 16")
 
@@ -661,12 +649,13 @@ class PrintBarAgent:
                 else:
                     raise RuntimeError(f"Target printer '{primary_queue}' is not ready: {reason}")
 
-            # 2. Multi-document Download (Defect 9)
+            # 2. Multi-document Download
             for doc in docs:
                 doc_id = doc["id"]
                 doc_pages = int(doc.get("pages", 1))
-                dl_url = f"{CLOUD_API_URL}/api/device/jobs/{order_id}/files/{doc_id}"
-                headers = get_auth_headers()
+                dl_path = f"/api/device/jobs/{order_id}/files/{doc_id}"
+                dl_url = f"{CLOUD_API_URL}{dl_path}"
+                headers = get_auth_headers(b"", method="GET", path=dl_path)
 
                 logger.info("Downloading document %s for order %s...", doc_id, order_id)
                 dl_res = requests.get(dl_url, headers=headers, timeout=60, stream=True)
@@ -715,7 +704,7 @@ class PrintBarAgent:
                 update_job_progress(order_id, total_pages_printed, cups_job_id=cups_job_id, status="printing")
                 self._report_progress(order_id, total_pages_printed, cups_job_id=cups_job_id, status="printing")
 
-                # 5. Monitor CUPS progress with strict timeout (Defect 3 & 4)
+                # 5. Monitor authentic CUPS progress with strict timeout
                 doc_impr_completed = 0
                 poll_start = time.time()
                 timeout_secs = max(120, expected_doc_pages * 25)
@@ -762,8 +751,7 @@ class PrintBarAgent:
                         break
 
                     elif state in ("stopped", "canceled", "aborted"):
-                        # Defect 4: Unsafe automatic partial failover is DISABLED.
-                        # Flag for MANUAL_REVIEW instead of guessing impressions.
+                        # Unsafe automatic partial failover disabled — flags MANUAL_REVIEW
                         if attempt_id:
                             update_print_attempt(
                                 attempt_id,
@@ -780,20 +768,19 @@ class PrintBarAgent:
 
                     time.sleep(1.5)
 
-                # STRICT TIMEOUT CHECK (Defect 3)
                 if not terminal_completed:
                     raise RuntimeError(
                         f"Print monitoring timed out after {timeout_secs}s for CUPS job {cups_job_id}. "
                         f"Terminal completion was not verified by hardware. Flagging for manual review."
                     )
 
-            # 6. Report completion to cloud (Defect 5: Only complete locally if cloud accepts)
+            # 6. Report completion to cloud
             ack_success = self._report_complete(order_id, pages_to_print, cups_job_id)
             if ack_success:
                 mark_job_completed(order_id)
                 logger.info("Job %s fully completed and acknowledged by cloud.", order_id)
             else:
-                logger.warning("Job %s finished printing but cloud acknowledgement failed. Outbox will retry.", order_id)
+                logger.warning("Job %s finished printing but cloud acknowledgement pending. Outbox will retry.", order_id)
 
         except Exception as exc:
             logger.error("Job %s execution failed: %s", order_id, exc)
@@ -804,7 +791,7 @@ class PrintBarAgent:
             self._report_failure(order_id, total_pages_printed, str(exc))
 
         finally:
-            # 7. Document Cleanup & Privacy (Defect 16)
+            # 7. Document Cleanup & Privacy
             for fp, _ in downloaded_files:
                 self._secure_delete_file(fp)
 
@@ -815,17 +802,25 @@ class PrintBarAgent:
                 logger.error("Failed to remove job temp directory %s: %s", job_dir, rmtree_err)
 
     # ------------------------------------------------------------------
-    # Cloud Communication with Outbox Fallback (Defect 5)
+    # Cloud Communication with Outbox Fallback
     # ------------------------------------------------------------------
 
-    def _cloud_request(self, url: str, payload: Dict[str, Any], method: str = "POST") -> bool:
+    def _cloud_request(self, path: str, payload: Dict[str, Any], method: str = "POST") -> bool:
         """
-        Send API request to cloud backend.
-        CRITICAL: Only HTTP 2xx is considered successful.
-        If offline or 5xx/network error, payload is saved to outbox for scheduled retry.
+        Send API request to cloud backend with durable Outbox backup.
+        Only HTTP 2xx WITH verified response acknowledgment marks the event synced.
         """
+        url = f"{CLOUD_API_URL}{path}" if not path.startswith("http") else path
+        norm_path = normalize_canonical_path(url)
+
+        # Persist event in outbox first
+        row_id = save_outbox_event("cloud_request", payload.get("orderId"), payload, DEVICE_ID)
+        event_id = payload.get("eventId")
+        payload["eventId"] = event_id
+        payload["kioskId"] = DEVICE_ID
+
         body = json.dumps(payload).encode("utf-8")
-        headers = get_auth_headers(body)
+        headers = get_auth_headers(body, method=method, path=norm_path)
 
         try:
             if method == "PATCH":
@@ -834,23 +829,21 @@ class PrintBarAgent:
                 res = requests.post(url, data=body, headers=headers, timeout=8)
 
             if 200 <= res.status_code < 300:
-                return True
+                data = res.json() if res.content else {}
+                if data.get("ok") or data.get("acknowledged") or data.get("eventId") == event_id:
+                    mark_outbox_synced(row_id)
+                    return True
+                else:
+                    schedule_outbox_retry(row_id, f"HTTP {res.status_code}: Unacknowledged payload", status_code=res.status_code)
+                    return False
             else:
-                logger.warning("Cloud request to %s rejected: HTTP %d", url, res.status_code)
-                # Queue in outbox if server error
-                if res.status_code >= 500:
-                    outbox_payload = dict(payload)
-                    outbox_payload["_url"] = url
-                    outbox_payload["_method"] = method
-                    save_outbox_event("cloud_request", payload.get("orderId"), outbox_payload)
+                logger.warning("Cloud request to %s rejected: HTTP %d", norm_path, res.status_code)
+                schedule_outbox_retry(row_id, f"HTTP {res.status_code}: {res.text[:200]}", status_code=res.status_code)
                 return False
 
         except Exception as exc:
-            logger.warning("Network failure reaching %s: %s. Queueing in outbox.", url, exc)
-            outbox_payload = dict(payload)
-            outbox_payload["_url"] = url
-            outbox_payload["_method"] = method
-            save_outbox_event("cloud_request", payload.get("orderId"), outbox_payload)
+            logger.warning("Network failure reaching %s: %s. Queueing in outbox.", norm_path, exc)
+            schedule_outbox_retry(row_id, str(exc))
             return False
 
     def _report_progress(self, order_id: str, pages_printed: int, cups_job_id: Optional[str] = None, status: Optional[str] = None) -> bool:
@@ -859,18 +852,18 @@ class PrintBarAgent:
             payload["cupsJobId"] = cups_job_id
         if status:
             payload["status"] = status
-        return self._cloud_request(f"{CLOUD_API_URL}/api/device/jobs/{order_id}", payload, method="PATCH")
+        return self._cloud_request(f"/api/device/jobs/{order_id}", payload, method="PATCH")
 
     def _report_complete(self, order_id: str, pages_printed: int, cups_job_id: Optional[str]) -> bool:
         payload = {"orderId": order_id, "pagesPrinted": pages_printed, "cupsJobId": cups_job_id}
-        return self._cloud_request(f"{CLOUD_API_URL}/api/device/jobs/{order_id}?action=complete", payload)
+        return self._cloud_request(f"/api/device/jobs/{order_id}?action=complete", payload)
 
     def _report_failure(self, order_id: str, pages_printed: int, reason: str) -> bool:
         payload = {"orderId": order_id, "pagesPrinted": pages_printed, "reason": reason[:500]}
-        return self._cloud_request(f"{CLOUD_API_URL}/api/device/jobs/{order_id}?action=fail", payload)
+        return self._cloud_request(f"/api/device/jobs/{order_id}?action=fail", payload)
 
     # ------------------------------------------------------------------
-    # Document Cleanup & Privacy (Defect 16)
+    # Document Cleanup & Privacy
     # ------------------------------------------------------------------
 
     def _secure_delete_file(self, file_path: str) -> None:

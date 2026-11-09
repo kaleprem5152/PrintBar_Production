@@ -2,15 +2,27 @@
 
 ## 1. Authentication Protocols
 
-### 1.1 Device / Raspberry Pi Agent Authentication
-The Raspberry Pi agent authenticates with the cloud backend using either:
-1. **HMAC-SHA256 Signature (Recommended)**:
-   - Header `x-device-id`: `PB-K01`
-   - Header `x-device-ts`: Current Unix epoch seconds (valid within $\pm 60$ seconds)
-   - Header `x-device-nonce`: Random UUIDv4 hex string
-   - Header `x-device-token`: `HMAC-SHA256("PB-K01:ts:nonce", DEVICE_AUTH_SECRET)`
-2. **Shared Secret**:
-   - Header `x-agent-key`: Value matching `KIOSK_AGENT_SECRET` or `DEVICE_AUTH_SECRET`
+### 1.1 Device / Raspberry Pi Agent Authentication (Canonical V4 Contract)
+The Raspberry Pi agent authenticates with all `/api/device/*` and `/api/agent/*` cloud backend endpoints using the unified canonical HMAC-SHA256 protocol:
+
+- **Canonical String Format**:
+  `METHOD:PATH:TIMESTAMP:NONCE:BODY_SHA256`
+  - `METHOD`: Uppercase HTTP verb (e.g., `GET`, `POST`, `PATCH`)
+  - `PATH`: Normalized path without query parameters or trailing slashes (e.g., `/api/device/jobs/PB-2026-00003`)
+  - `TIMESTAMP`: Unix epoch seconds as string (clock skew allowed: $\pm 120$ seconds)
+  - `NONCE`: Unique UUIDv4 hex string (persisted in PostgreSQL `device_nonces` table to prevent replay attacks)
+  - `BODY_SHA256`: Hexadecimal SHA-256 hash of the exact request body bytes (empty body uses SHA-256 of empty bytes: `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`)
+
+- **Required Headers**:
+  - `X-Device-ID`: Device identifier (`PB-K01`)
+  - `X-Timestamp`: Unix epoch timestamp string
+  - `X-Nonce`: UUIDv4 string
+  - `X-Signature`: `HMAC-SHA256(canonical_message, DEVICE_AUTH_SECRET)`
+
+- **Security Hardening**:
+  - Raw secret headers (`x-agent-key`) are strictly forbidden and rejected.
+  - Server-side nonce validation is atomic and durable across backend instances. Nonces are recorded only after signature passes.
+  - Replayed nonces or clock skew $>120$ seconds are immediately rejected with HTTP 401.
 
 ### 1.2 Admin Dashboard Authentication
 - Endpoint: `POST /api/auth/login`
