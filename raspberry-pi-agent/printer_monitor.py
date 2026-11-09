@@ -157,6 +157,15 @@ class PrinterMonitor:
         # 3. IPP attribute query (if IP configured and reachable)
         if ip and result["reachable"]:
             ipp_info = self._check_ipp_status(ip)
+            if ipp_info.get("parse_error"):
+                logger.warning("IPP parsing failure from %s — response malformed or truncated.", ip)
+                result.update(
+                    state=STATE_UNKNOWN,
+                    source="ipp_parse_error",
+                    reason="Malformed or truncated IPP response from printer.",
+                )
+                return result
+
             if ipp_info.get("success"):
                 result["ipp_state"] = ipp_info.get("printer_state")
                 result["markers"] = ipp_info.get("markers", {})
@@ -315,9 +324,10 @@ class PrinterMonitor:
 
             parsed = self._parse_ipp_response(ipp_body)
             result.update(parsed)
-            result["success"] = True
+            result["success"] = not parsed.get("parse_error") and (parsed.get("printer_state") is not None)
         except Exception as exc:
             logger.debug("IPP query to %s:%d failed: %s", ip, port, exc)
+            result["parse_error"] = True
         return result
 
     def _build_ipp_get_printer_attrs(self, ip: str, port: int) -> bytes:
@@ -350,10 +360,19 @@ class PrinterMonitor:
             "printer_state_reasons": "",
             "printer_state_message": "",
             "markers": {},
+            "parse_error": False,
         }
         try:
             if len(body) < 8:
+                result["parse_error"] = True
                 return result
+
+            # Status code validation (bytes 2-3: 0x0000 = successful-ok)
+            status_code = struct.unpack(">H", body[2:4])[0]
+            if status_code > 0x00FF:
+                logger.debug("IPP response returned non-ok status: 0x%04x", status_code)
+                result["parse_error"] = True
+
             pos = 8
             reasons = []
             while pos < len(body):
@@ -363,21 +382,38 @@ class PrinterMonitor:
                     if tag == 0x03:
                         break
                     continue
+
                 if pos + 2 > len(body):
+                    result["parse_error"] = True
                     break
                 name_len = struct.unpack(">H", body[pos : pos + 2])[0]
                 pos += 2
+
+                if pos + name_len > len(body):
+                    result["parse_error"] = True
+                    break
                 name = body[pos : pos + name_len].decode("utf-8", errors="replace")
                 pos += name_len
+
                 if pos + 2 > len(body):
+                    result["parse_error"] = True
                     break
-                val_len = struct.unpack(">H", body[pos : pos + val_len])[0]
+                val_len = struct.unpack(">H", body[pos : pos + 2])[0]
                 pos += 2
+
+                if pos + val_len > len(body):
+                    result["parse_error"] = True
+                    break
                 value = body[pos : pos + val_len]
                 pos += val_len
 
-                if name == "printer-state" and len(value) == 4:
-                    result["printer_state"] = struct.unpack(">I", value)[0]
+                if name == "printer-state":
+                    if len(value) == 4:
+                        result["printer_state"] = struct.unpack(">I", value)[0]
+                    elif len(value) == 2:
+                        result["printer_state"] = struct.unpack(">H", value)[0]
+                    elif len(value) == 1:
+                        result["printer_state"] = value[0]
                 elif name == "printer-state-reasons":
                     reasons.append(value.decode("utf-8", errors="replace"))
                 elif name == "printer-state-message":
@@ -386,6 +422,7 @@ class PrinterMonitor:
             result["printer_state_reasons"] = ", ".join(reasons)
         except Exception as exc:
             logger.debug("IPP parse error: %s", exc)
+            result["parse_error"] = True
         return result
 
     def _classify_ipp(self, ipp_info: Dict[str, Any]) -> str:

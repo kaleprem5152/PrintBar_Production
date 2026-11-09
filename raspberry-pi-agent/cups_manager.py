@@ -140,8 +140,8 @@ class CupsManager:
                     cups_job_id = match.group(1)
                     logger.info(f"CUPS accepted job: {cups_job_id}")
                     return True, cups_job_id, None
-                logger.warning(f"Could not parse CUPS job ID from output: {res.stdout}")
-                return True, "unknown_job_id", None
+                logger.error("Uncertain CUPS submission: lp succeeded (code 0) but job ID could not be extracted: %s", res.stdout)
+                return False, "UNKNOWN/RECONCILIATION_REQUIRED", "CUPS submission output unparseable. Output is uncertain; physical reconciliation required."
             else:
                 error_msg = res.stderr.strip() or f"lp exited with code {res.returncode}"
                 logger.error(f"CUPS print failure: {error_msg}")

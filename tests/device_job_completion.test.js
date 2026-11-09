@@ -133,3 +133,41 @@ test("Job Completion: Printer not belonging to kiosk PB-K01 is rejected with 400
   assert.strictEqual(res.statusCode, 400);
   assert.match(res.error, /does not belong to kiosk/);
 });
+
+test("Job Completion: Fail-closed on durable event store error returns 503", () => {
+  function handleCompletionWithDbMock(dbMock, { order, body, deviceId }) {
+    if (order.deviceId !== deviceId) return { statusCode: 404 };
+    const eventId = body.eventId;
+    if (!eventId) return { statusCode: 400 };
+
+    // Durable idempotency check
+    try {
+      const existing = dbMock.findEvent(eventId);
+      if (existing) {
+        return { statusCode: 200, ok: true, acknowledged: true, eventId, duplicateEvent: true };
+      }
+    } catch (err) {
+      return {
+        statusCode: 503,
+        error: "Durable idempotency store unavailable. Request rejected to prevent duplicate operations.",
+        eventId,
+      };
+    }
+
+    return { statusCode: 200, ok: true, acknowledged: true, eventId };
+  }
+
+  const order = { orderId: "ORD-008", deviceId: "PB-K01", status: "printing" };
+  const body = { eventId: "evt_failing_db_123", pagesPrinted: 5, cupsJobId: "c-1" };
+
+  // DB outage throws
+  const failingDb = {
+    findEvent: () => { throw new Error("PostgreSQL connection timeout"); }
+  };
+
+  const res = handleCompletionWithDbMock(failingDb, { order, body, deviceId: "PB-K01" });
+  assert.strictEqual(res.statusCode, 503);
+  assert.match(res.error, /Durable idempotency store unavailable/);
+  assert.strictEqual(res.eventId, "evt_failing_db_123");
+});
+

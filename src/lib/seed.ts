@@ -34,10 +34,10 @@ export function ensureBootstrap(): Promise<void> {
       for (const u of BOOTSTRAP_USERS) {
         await db
           .insert(s.adminUsers)
-          .values({ ...u, passwordHash: pw, active: true, mustChangePassword: false })
+          .values({ ...u, passwordHash: pw, active: true, mustChangePassword: false, failedLogins: 0, lockedUntil: null })
           .onConflictDoUpdate({
             target: s.adminUsers.email,
-            set: { username: u.username, active: true },
+            set: { username: u.username, active: true, passwordHash: pw, failedLogins: 0, lockedUntil: null },
           })
           .catch(() => {});
       }

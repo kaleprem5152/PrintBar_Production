@@ -80,3 +80,51 @@ def test_is_printer_ready_helper(monitor):
         ready, reason = monitor.is_printer_ready("kyocera")
         assert ready is False
         assert "media-empty" in reason
+
+
+def test_parse_ipp_response_valid(monitor):
+    import struct
+    # Version 2.0 (0x0200), Status 0 (successful-ok), Request ID 1
+    header = struct.pack(">HHI", 0x0200, 0x0000, 1)
+    # Delimiter: operation-attributes (0x01)
+    delim = b"\x01"
+    # Tag 0x23 (enum), name: 'printer-state' (len 13), val_len: 4, val: 3 (idle)
+    attr1 = b"\x23" + struct.pack(">H", 13) + b"printer-state" + struct.pack(">H", 4) + struct.pack(">I", 3)
+    # Tag 0x44 (keyword), name: 'printer-state-reasons' (len 21), val_len: 4, val: 'none'
+    attr2 = b"\x44" + struct.pack(">H", 21) + b"printer-state-reasons" + struct.pack(">H", 4) + b"none"
+    # End tag 0x03
+    end = b"\x03"
+    body = header + delim + attr1 + attr2 + end
+
+    parsed = monitor._parse_ipp_response(body)
+    assert parsed.get("parse_error") is False
+    assert parsed.get("printer_state") == 3
+    assert parsed.get("printer_state_reasons") == "none"
+
+
+def test_parse_ipp_response_truncated_header(monitor):
+    body = b"\x02\x00\x00"  # Less than 8 bytes
+    parsed = monitor._parse_ipp_response(body)
+    assert parsed.get("parse_error") is True
+
+
+def test_parse_ipp_response_truncated_attribute(monitor):
+    import struct
+    header = struct.pack(">HHI", 0x0200, 0x0000, 1)
+    # Attribute says name is 50 bytes, but body ends immediately
+    malformed = header + b"\x23" + struct.pack(">H", 50) + b"short"
+    parsed = monitor._parse_ipp_response(malformed)
+    assert parsed.get("parse_error") is True
+
+
+
+def test_get_unified_status_on_ipp_parse_error(monitor):
+    from printer_monitor import STATE_UNKNOWN
+    with patch.object(monitor, "_check_cups_queue", return_value={"state": "idle", "reason": ""}):
+        with patch.object(monitor, "_check_tcp", return_value=True):
+            with patch.object(monitor, "_check_ipp_status", return_value={"success": False, "parse_error": True}):
+                st = monitor.get_unified_status("kyocera", "192.168.1.101", "printbar-kyocera")
+                assert st["state"] == STATE_UNKNOWN
+                assert st["source"] == "ipp_parse_error"
+                assert "Malformed or truncated IPP response" in st["reason"]
+

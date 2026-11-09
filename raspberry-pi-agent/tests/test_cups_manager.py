@@ -87,6 +87,27 @@ def test_print_file_failure(cups, tmp_path):
         assert "Error - queue stopped" in err
 
 
+def test_print_file_unparseable_output_returns_uncertain(cups, tmp_path):
+    # When lp exits 0 but does not yield 'request id is', never return normal success
+    dummy_file = tmp_path / "sample.pdf"
+    dummy_file.write_bytes(b"%PDF-1.4 mock content")
+
+    mock_res = MagicMock()
+    mock_res.returncode = 0
+    mock_res.stdout = "Submitted job to spooler successfully\n"  # missing 'request id is'
+    mock_res.stderr = ""
+
+    with patch("subprocess.run", return_value=mock_res):
+        success, job_id, err = cups.print_file(
+            file_path=str(dummy_file),
+            printer_queue=cups.kyocera_queue,
+        )
+        assert success is False
+        assert job_id == "UNKNOWN/RECONCILIATION_REQUIRED"
+        assert "unparseable" in err.lower()
+
+
+
 def test_cancel_job(cups):
     mock_res = MagicMock()
     mock_res.returncode = 0

@@ -109,24 +109,30 @@ export async function POST(req: Request, ctx: Params) {
   // Action: Complete
   // ══════════════════════════════════════════════════════════════════════════
   if (action === "complete") {
-    // 1. Event-level idempotency: Check if this eventId was already processed
+    // 1. Durable Event-level Idempotency (Fail-closed)
+    let existingEv;
     try {
-      const [existingEv] = await db
+      const [ev] = await db
         .select()
         .from(deviceEvents)
         .where(eq(deviceEvents.eventId, eventId));
-      if (existingEv) {
-        return Response.json({
-          ok: true,
-          acknowledged: true,
-          eventId,
-          status: order.status,
-          alreadyCompleted: order.status === "completed",
-          duplicateEvent: true,
-        });
-      }
-    } catch {
-      // Continue if events table not available
+      existingEv = ev;
+    } catch (dbErr) {
+      console.error(`[jobs] Durable event lookup failed for eventId ${eventId}:`, (dbErr as Error).message);
+      return Response.json(
+        { error: "Durable idempotency store unavailable. Request rejected to prevent duplicate operations.", eventId },
+        { status: 503 }
+      );
+    }
+    if (existingEv) {
+      return Response.json({
+        ok: true,
+        acknowledged: true,
+        eventId,
+        status: order.status,
+        alreadyCompleted: order.status === "completed",
+        duplicateEvent: true,
+      });
     }
 
     // 2. Order status idempotency: if already completed, do NOT re-deduct paper or duplicate events
@@ -187,15 +193,13 @@ export async function POST(req: Request, ctx: Params) {
 
     // 6. Atomic Database Transaction: Order state + Device Paper + Admin Printers + Event Log
     await db.transaction(async (tx) => {
-      try {
-        await tx.insert(deviceEvents).values({
-          eventId,
-          orderId,
-          deviceId: auth.deviceId!,
-          action: "complete",
-          payload: { pagesPrinted, cupsJobId },
-        }).onConflictDoNothing();
-      } catch {}
+      await tx.insert(deviceEvents).values({
+        eventId,
+        orderId,
+        deviceId: auth.deviceId!,
+        action: "complete",
+        payload: { pagesPrinted, cupsJobId },
+      });
 
       await tx
         .update(orders)
@@ -301,6 +305,32 @@ export async function POST(req: Request, ctx: Params) {
   // Action: Fail
   // ══════════════════════════════════════════════════════════════════════════
   if (action === "fail") {
+    // 1. Durable Event-level Idempotency (Fail-closed)
+    let existingFailEv;
+    try {
+      const [ev] = await db
+        .select()
+        .from(deviceEvents)
+        .where(eq(deviceEvents.eventId, eventId));
+      existingFailEv = ev;
+    } catch (dbErr) {
+      console.error(`[jobs] Durable event lookup failed for fail eventId ${eventId}:`, (dbErr as Error).message);
+      return Response.json(
+        { error: "Durable idempotency store unavailable. Request rejected to prevent duplicate operations.", eventId },
+        { status: 503 }
+      );
+    }
+    if (existingFailEv) {
+      return Response.json({
+        ok: true,
+        acknowledged: true,
+        eventId,
+        status: order.status,
+        alreadyFailed: order.status === "failed",
+        duplicateEvent: true,
+      });
+    }
+
     if (order.status === "failed") {
       return Response.json({
         ok: true,
@@ -326,15 +356,13 @@ export async function POST(req: Request, ctx: Params) {
     const now = new Date();
 
     await db.transaction(async (tx) => {
-      try {
-        await tx.insert(deviceEvents).values({
-          eventId,
-          orderId,
-          deviceId: auth.deviceId!,
-          action: "fail",
-          payload: { pagesPrinted: actualPagesPrinted, reason },
-        }).onConflictDoNothing();
-      } catch {}
+      await tx.insert(deviceEvents).values({
+        eventId,
+        orderId,
+        deviceId: auth.deviceId!,
+        action: "fail",
+        payload: { pagesPrinted: actualPagesPrinted, reason },
+      });
 
       await tx
         .update(orders)

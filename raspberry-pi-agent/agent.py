@@ -734,6 +734,11 @@ class PrintBarAgent:
                 if not success:
                     if attempt_id:
                         update_print_attempt(attempt_id, result="failed", error_msg=err, ended=True)
+                    if cups_job_id == "UNKNOWN/RECONCILIATION_REQUIRED":
+                        logger.critical("Uncertain print submission for %s. Halting for MANUAL_REVIEW.", order_id)
+                        mark_job_manual_review(order_id, f"Uncertain submission on {primary_queue}: {err}")
+                        self._report_failure(order_id, total_pages_printed, f"MANUAL_REVIEW: {err}")
+                        return
                     raise RuntimeError(f"CUPS print submission failed on '{primary_queue}': {err}")
 
                 if attempt_id:
