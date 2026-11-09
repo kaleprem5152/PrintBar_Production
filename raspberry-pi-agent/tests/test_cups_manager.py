@@ -113,3 +113,4 @@ printbar-kyocera-101 root 1024 Mon Nov 09 18:00:00 2026
         assert prog["sheets_completed"] == 2
         assert prog["state"] == "processing"
         assert prog["is_active"] is True
+

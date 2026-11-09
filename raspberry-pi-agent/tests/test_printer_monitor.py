@@ -18,6 +18,7 @@ from printer_monitor import (
     STATE_PAPER_JAM,
     STATE_OFFLINE,
     STATE_DISABLED,
+    STATE_ERROR,
 )
 
 
@@ -43,11 +44,21 @@ def test_classify_ipp_reasons(monitor):
 
 
 def test_get_unified_status_offline(monitor):
-    with patch.object(monitor, "_check_cups_queue", return_value={"state": None, "reason": ""}):
+    with patch.object(monitor, "_check_cups_queue", return_value={"state": "idle", "reason": ""}):
         with patch.object(monitor, "_check_tcp", return_value=False):
             st = monitor.get_unified_status("kyocera", "192.168.1.101", "printbar-kyocera")
             assert st["state"] == STATE_OFFLINE
             assert st["reachable"] is False
+
+
+def test_get_unified_status_missing_queue_never_ready(monitor):
+    # Even if IPP is reachable, missing queue must report error
+    with patch.object(monitor, "_check_cups_queue", return_value={"state": "missing"}):
+        with patch.object(monitor, "_check_tcp", return_value=True):
+            with patch.object(monitor, "_check_ipp_status", return_value={"success": True, "printer_state": 3}):
+                st = monitor.get_unified_status("kyocera", "192.168.1.101", "printbar-kyocera")
+                assert st["state"] == STATE_ERROR
+                assert "does not exist" in st["reason"]
 
 
 def test_get_unified_status_ready_cups(monitor):
@@ -61,11 +72,11 @@ def test_get_unified_status_ready_cups(monitor):
 
 
 def test_is_printer_ready_helper(monitor):
-    with patch.object(monitor, "get_unified_status", return_value={"state": STATE_READY, "reason": ""}):
+    with patch.object(monitor, "get_unified_status", return_value={"state": STATE_READY, "cups_state": "idle", "reason": ""}):
         ready, reason = monitor.is_printer_ready("kyocera")
         assert ready is True
 
-    with patch.object(monitor, "get_unified_status", return_value={"state": STATE_PAPER_OUT, "reason": "media-empty"}):
+    with patch.object(monitor, "get_unified_status", return_value={"state": STATE_PAPER_OUT, "cups_state": "idle", "reason": "media-empty"}):
         ready, reason = monitor.is_printer_ready("kyocera")
         assert ready is False
         assert "media-empty" in reason

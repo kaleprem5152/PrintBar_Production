@@ -17,7 +17,7 @@ const int = (v: unknown, lo = 0, hi = 100000000) => (typeof v === "number" && Nu
  * and each printer metric is tagged as `telemetry` — missing sensors stay NULL/"unsupported" instead of being invented.
  */
 export async function POST(req: NextRequest) {
-  const denied = agentAuth(req);
+  const denied = await agentAuth(req);
   if (denied) return denied;
   const b = (await req.json().catch(() => null)) as Record<string, any> | null; // eslint-disable-line @typescript-eslint/no-explicit-any
   if (!b?.kioskId) return Response.json({ error: "kioskId required" }, { status: 400 });

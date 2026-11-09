@@ -717,6 +717,19 @@ export const auditEvents = pgTable(
   ]
 );
 
+export const deviceNonces = pgTable(
+  "device_nonces",
+  {
+    nonce: text("nonce").primaryKey(),
+    deviceId: text("device_id").notNull(),
+    createdAt: timestamp("created_at").notNull().defaultNow(),
+  },
+  (t) => [
+    index("dn_created_idx").on(t.createdAt),
+    index("dn_device_idx").on(t.deviceId),
+  ]
+);
+
 /* Type helpers */
 export type OrderRow               = typeof orders.$inferSelect;
 export type OrderInsert            = typeof orders.$inferInsert;
@@ -728,3 +741,4 @@ export type PrinterStatusHistoryRow= typeof printerStatusHistory.$inferSelect;
 export type PricingConfigRow       = typeof pricingConfig.$inferSelect;
 export type AuditEventRow          = typeof auditEvents.$inferSelect;
 export type DevicePrintJobRow      = typeof devicePrintJobs.$inferSelect;
+export type DeviceNonceRow         = typeof deviceNonces.$inferSelect;

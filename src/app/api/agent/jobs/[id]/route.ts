@@ -11,7 +11,7 @@ export const dynamic = "force-dynamic";
  * Closes the loop for dashboard-queued retries. A terminal attempt can never be re-opened (no duplicate print).
  */
 export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
-  const denied = agentAuth(req);
+  const denied = await agentAuth(req);
   if (denied) return denied;
   const { id } = await ctx.params;
   const b = (await req.json().catch(() => ({}))) as { attemptNo?: number; status?: string; pagesPrinted?: number; error?: string; cupsJobId?: string };

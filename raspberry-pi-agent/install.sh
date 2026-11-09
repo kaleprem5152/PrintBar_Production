@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# PrintBar Raspberry Pi Production Installer v3.0
+# PrintBar Raspberry Pi Production Installer v3.1
 # Target: Raspberry Pi OS 64-bit (Debian Bookworm/Bullseye)
 # Installs to /opt/printbar/agent, config at /etc/printbar/printbar.env
-# Idempotent: safe to re-run after partial failures
+# Hardened: No 'pi' assumptions, no remote CUPS admin, no --no-sandbox.
 # ==============================================================================
 set -euo pipefail
 
-PRINTBAR_VERSION="3.0.0"
+PRINTBAR_VERSION="3.1.0"
 INSTALL_PREFIX="/opt/printbar"
 AGENT_DIR="${INSTALL_PREFIX}/agent"
 VENV_DIR="${INSTALL_PREFIX}/venv"
@@ -33,59 +33,68 @@ echo "   Target: PB-K01 — SGU Food Court"
 echo "============================================================"
 echo ""
 
-# --- Root check ---
+# 1. Root check
 if [[ $EUID -ne 0 ]]; then
     fail "This installer must be run as root: sudo bash install.sh"
     exit 1
 fi
 
-# --- Raspberry Pi check ---
+# 2. Hardware check
 if grep -qi "raspberry pi" /proc/device-tree/model 2>/dev/null; then
     pass "Running on Raspberry Pi hardware"
 else
-    warn "Not detected as Raspberry Pi — proceeding anyway (CI/test mode)"
+    warn "Not detected as Raspberry Pi — proceeding in generic Linux mode"
 fi
 
-# --- Detect actual user ---
-INSTALL_USER="${SUDO_USER:-$(logname 2>/dev/null || echo pi)}"
-info "Installing for user: ${INSTALL_USER}"
+# 3. Detect actual desktop kiosk user (never assume 'pi')
+DETECTED_USER="${KIOSK_USER:-${SUDO_USER:-}}"
+if [[ -z "${DETECTED_USER}" || "${DETECTED_USER}" == "root" ]]; then
+    # Find first regular user with UID >= 1000
+    DETECTED_USER=$(awk -F: '$3 >= 1000 && $3 < 60000 {print $1; exit}' /etc/passwd || echo "")
+fi
+if [[ -z "${DETECTED_USER}" ]]; then
+    fail "Could not determine local non-root desktop user. Specify with: KIOSK_USER=username sudo bash install.sh"
+    exit 1
+fi
+USER_HOME=$(getent passwd "${DETECTED_USER}" | cut -d: -f6)
+info "Target display/desktop user: ${DETECTED_USER} (Home: ${USER_HOME})"
 
-# ==============================================================================
-# 1. System packages
-# ==============================================================================
-info "[1/9] Installing system packages..."
+# 4. System packages installation
+info "[1/8] Installing system dependencies..."
 apt-get update -qq
 apt-get install -y --no-install-recommends \
     cups cups-client cups-bsd libcups2-dev \
     python3 python3-pip python3-venv python3-dev \
     python3-psutil \
-    chromium-browser unclutter \
-    curl git jq \
-    avahi-utils \
+    unclutter curl git jq \
     openssl
-pass "System packages installed"
 
-# ==============================================================================
-# 2. Create service user
-# ==============================================================================
-info "[2/9] Creating service user '${SERVICE_USER}'..."
+# Locate Chromium executable
+CHROMIUM_BIN=$(command -v chromium-browser 2>/dev/null || command -v chromium 2>/dev/null || command -v google-chrome 2>/dev/null || echo "")
+if [[ -z "${CHROMIUM_BIN}" ]]; then
+    info "Installing chromium..."
+    apt-get install -y chromium-browser 2>/dev/null || apt-get install -y chromium 2>/dev/null || true
+    CHROMIUM_BIN=$(command -v chromium-browser 2>/dev/null || command -v chromium 2>/dev/null || echo "")
+fi
+
+if [[ -n "${CHROMIUM_BIN}" ]]; then
+    pass "Chromium binary found: ${CHROMIUM_BIN}"
+else
+    warn "Chromium not found. Kiosk browser service will require manual package installation."
+fi
+
+# 5. Service user setup
+info "[2/8] Creating service user '${SERVICE_USER}'..."
 if id "${SERVICE_USER}" &>/dev/null; then
-    warn "User '${SERVICE_USER}' already exists — skipping creation"
+    pass "User '${SERVICE_USER}' exists"
 else
     useradd -r -s /sbin/nologin -d "${DATA_DIR}" "${SERVICE_USER}"
     pass "Service user '${SERVICE_USER}' created"
 fi
 
-# Add to lpadmin group for CUPS access
-usermod -aG lpadmin "${SERVICE_USER}" 2>/dev/null || true
-usermod -aG lpadmin "${INSTALL_USER}" 2>/dev/null || true
-
-# ==============================================================================
-# 3. Install agent code
-# ==============================================================================
-info "[3/9] Installing agent code to ${AGENT_DIR}..."
+# 6. Install agent code
+info "[3/8] Deploying agent source to ${AGENT_DIR}..."
 mkdir -p "${AGENT_DIR}"
-# Copy agent files from current directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cp -f "${SCRIPT_DIR}/agent.py"           "${AGENT_DIR}/"
 cp -f "${SCRIPT_DIR}/config.py"          "${AGENT_DIR}/"
@@ -94,60 +103,45 @@ cp -f "${SCRIPT_DIR}/db.py"              "${AGENT_DIR}/"
 cp -f "${SCRIPT_DIR}/cups_manager.py"    "${AGENT_DIR}/"
 cp -f "${SCRIPT_DIR}/printer_monitor.py" "${AGENT_DIR}/"
 cp -f "${SCRIPT_DIR}/requirements.txt"   "${AGENT_DIR}/"
-
-# Set ownership
 chown -R root:root "${AGENT_DIR}"
 chmod 755 "${AGENT_DIR}"
 chmod 644 "${AGENT_DIR}"/*.py "${AGENT_DIR}/requirements.txt"
-pass "Agent code installed"
+pass "Agent code deployed"
 
-# ==============================================================================
-# 4. Python virtual environment
-# ==============================================================================
-info "[4/9] Setting up Python virtual environment..."
+# 7. Python virtual environment
+info "[4/8] Configuring Python environment..."
 if [[ ! -f "${VENV_DIR}/bin/python" ]]; then
     python3 -m venv "${VENV_DIR}"
-    pass "Virtual environment created"
-else
-    warn "Virtual environment already exists — upgrading packages"
 fi
-
 "${VENV_DIR}/bin/pip" install --upgrade pip --quiet
 "${VENV_DIR}/bin/pip" install -r "${AGENT_DIR}/requirements.txt" --quiet
-pass "Python dependencies installed"
+pass "Python environment ready"
 
-# ==============================================================================
-# 5. Data and log directories
-# ==============================================================================
-info "[5/9] Creating data directories..."
+# 8. Data directories
+info "[5/8] Initialising data directories..."
 mkdir -p "${DATA_DIR}" "${JOBS_DIR}" "${LOG_DIR}"
 chown -R "${SERVICE_USER}:${SERVICE_USER}" "${DATA_DIR}" "${LOG_DIR}"
 chmod 750 "${DATA_DIR}" "${LOG_DIR}"
 chmod 700 "${JOBS_DIR}"
-pass "Data directories ready"
+pass "Data directories configured"
 
-# ==============================================================================
-# 6. Configuration file
-# ==============================================================================
-info "[6/9] Setting up configuration..."
+# 9. Configuration file
+info "[6/8] Checking configuration..."
 mkdir -p "${CONFIG_DIR}"
 chmod 750 "${CONFIG_DIR}"
 
 if [[ -f "${CONFIG_FILE}" ]]; then
-    warn "Config file already exists at ${CONFIG_FILE} — NOT overwriting (run upgrade.sh to update)"
+    pass "Configuration preserved at ${CONFIG_FILE}"
 else
-    # Generate a fresh secret
     GENERATED_SECRET=$(openssl rand -hex 32)
     cat > "${CONFIG_FILE}" <<EOF
 # PrintBar Agent Production Configuration
-# Generated by installer on $(date -Iseconds)
-# EDIT THIS FILE with your actual values before starting the service.
+# Generated on $(date -Iseconds)
 
 CLOUD_API_URL=https://printbarproduction-production.up.railway.app
 DEVICE_ID=PB-K01
 DEVICE_AUTH_SECRET=${GENERATED_SECRET}
 
-# Printer IPs — REQUIRED. Assign static IPs via your router DHCP reservation.
 KYOCERA_IP=
 CANON_IP=
 
@@ -168,16 +162,13 @@ KIOSK_URL=https://printbarproduction-production.up.railway.app/kiosk
 EOF
     chmod 640 "${CONFIG_FILE}"
     chown root:"${SERVICE_USER}" "${CONFIG_FILE}"
-    pass "Configuration file created at ${CONFIG_FILE}"
-    warn "ACTION REQUIRED: Edit ${CONFIG_FILE} and set KYOCERA_IP, CANON_IP before starting the service."
+    pass "Created configuration template at ${CONFIG_FILE}"
 fi
 
-# ==============================================================================
-# 7. Sudoers (minimal — only what CUPS management needs)
-# ==============================================================================
-info "[7/9] Installing sudoers rules..."
+# 10. Minimal Sudoers
+info "[7/8] Securing sudoers privileges..."
 cat > "${SUDOERS_FILE}" <<'EOF'
-# PrintBar agent — minimal CUPS management permissions
+# PrintBar minimal hardware agent permissions
 printbar ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart cups
 printbar ALL=(ALL) NOPASSWD: /usr/sbin/lpadmin
 printbar ALL=(ALL) NOPASSWD: /usr/bin/lpstat
@@ -185,21 +176,15 @@ printbar ALL=(ALL) NOPASSWD: /usr/bin/lp
 printbar ALL=(ALL) NOPASSWD: /usr/bin/cancel
 EOF
 chmod 440 "${SUDOERS_FILE}"
-visudo -c -f "${SUDOERS_FILE}" || { fail "Sudoers file syntax error!"; rm -f "${SUDOERS_FILE}"; exit 1; }
-pass "Sudoers rules installed"
+visudo -c -f "${SUDOERS_FILE}" || { fail "Sudoers syntax check failed"; exit 1; }
+pass "Minimal sudoers established"
 
-# ==============================================================================
-# 8. Systemd services
-# ==============================================================================
-info "[8/9] Installing systemd services..."
-
-# Detect display/session for kiosk service
-DISPLAY_ENV=":0"
-XAUTH_PATH="/home/${INSTALL_USER}/.Xauthority"
+# 11. Systemd Units
+info "[8/8] Installing systemd units..."
 
 cat > "${SYSTEMD_DIR}/printbar-agent.service" <<EOF
 [Unit]
-Description=PrintBar Hardware & CUPS Print Agent (PB-K01)
+Description=PrintBar Hardware & CUPS Daemon (PB-K01)
 After=network-online.target cups.service
 Wants=network-online.target cups.service
 Requires=cups.service
@@ -229,32 +214,27 @@ PrivateTmp=yes
 WantedBy=multi-user.target
 EOF
 
-# Detect chromium binary
-CHROMIUM_BIN=$(command -v chromium-browser 2>/dev/null || command -v chromium 2>/dev/null || echo "chromium-browser")
-
 cat > "${SYSTEMD_DIR}/printbar-kiosk.service" <<EOF
 [Unit]
-Description=PrintBar Kiosk Browser Display
-After=graphical-session.target network-online.target printbar-agent.service
-Wants=graphical-session.target
+Description=PrintBar Kiosk Fullscreen Browser
+After=graphical.target network-online.target printbar-agent.service
+Wants=graphical.target
 
 [Service]
 Type=simple
-User=${INSTALL_USER}
-Environment=DISPLAY=${DISPLAY_ENV}
-Environment=XAUTHORITY=${XAUTH_PATH}
+User=${DETECTED_USER}
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=${USER_HOME}/.Xauthority
 EnvironmentFile=${CONFIG_FILE}
 ExecStartPre=/bin/sleep 5
 ExecStart=${CHROMIUM_BIN} \\
     --kiosk \\
-    --no-sandbox \\
     --disable-infobars \\
     --disable-session-crashed-bubble \\
     --disable-restore-session-state \\
     --disable-background-networking \\
     --noerrdialogs \\
     --check-for-update-interval=31536000 \\
-    --ozone-platform-hint=auto \\
     \${KIOSK_URL}
 Restart=on-failure
 RestartSec=5
@@ -263,47 +243,24 @@ StandardError=journal
 SyslogIdentifier=printbar-kiosk
 
 [Install]
-WantedBy=graphical-session.target
+WantedBy=graphical.target
 EOF
 
 systemctl daemon-reload
 systemctl enable printbar-agent.service
-# kiosk service requires graphical session — enable only if desktop is detected
-if systemctl list-units --type=target | grep -q graphical.target; then
-    systemctl enable printbar-kiosk.service
-    pass "printbar-kiosk.service enabled"
-else
-    warn "No graphical target detected — printbar-kiosk.service not enabled"
-fi
-pass "Systemd services installed"
 
-# ==============================================================================
-# 9. CUPS configuration
-# ==============================================================================
-info "[9/9] Configuring CUPS..."
+# Local CUPS configuration (Local only — NO remote administration)
 systemctl enable cups
 systemctl start cups || true
-cupsctl --remote-admin --share-printers 2>/dev/null || true
-pass "CUPS configured"
+pass "System services enabled"
 
-# ==============================================================================
-# Summary
-# ==============================================================================
 echo ""
 echo "============================================================"
-echo "   PrintBar Installer Complete"
+echo "   Installation Completed Successfully"
 echo "============================================================"
+echo " Next steps:"
+echo " 1. Configure printer static IPs in ${CONFIG_FILE}"
+echo " 2. Run 'sudo bash configure-printers.sh' to register CUPS queues"
+echo " 3. Verify health with 'sudo bash doctor.sh'"
+echo " 4. Start agent: 'sudo systemctl start printbar-agent'"
 echo ""
-pass "Agent code:  ${AGENT_DIR}"
-pass "Config:      ${CONFIG_FILE}"
-pass "Data:        ${DATA_DIR}"
-pass "Services:    printbar-agent, printbar-kiosk"
-echo ""
-echo -e "${YELLOW}NEXT STEPS:${NC}"
-echo " 1. Edit ${CONFIG_FILE} — set KYOCERA_IP and CANON_IP"
-echo " 2. Run printer setup: sudo bash ${SCRIPT_DIR}/configure-printers.sh"
-echo " 3. Start agent: sudo systemctl start printbar-agent"
-echo " 4. Run health check: sudo bash ${SCRIPT_DIR}/doctor.sh"
-echo " 5. Reboot: sudo reboot"
-echo ""
-

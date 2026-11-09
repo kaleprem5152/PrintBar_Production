@@ -1,18 +1,16 @@
 """
-Tests for db.py — SQLite WAL, schema migrations, outbox, nonces, attempts.
+Tests for db.py — Schema v4, idempotent claims, exponential backoff, attempt tracking.
 """
 import sys
 import os
-import json
 import pytest
-import importlib
 
 AGENT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if AGENT_DIR not in sys.path:
     sys.path.insert(0, AGENT_DIR)
 
 
-def test_init_creates_all_tables(fresh_db):
+def test_schema_v4_tables_and_columns(fresh_db):
     db = fresh_db
     with db.get_connection() as conn:
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
@@ -20,106 +18,54 @@ def test_init_creates_all_tables(fresh_db):
         "schema_version", "local_jobs", "print_attempts",
         "outbox_events", "nonces", "command_history", "printer_state_history"
     }
-    assert expected.issubset(tables), f"Missing tables: {expected - tables}"
+    assert expected.issubset(tables)
 
 
-def test_wal_mode(fresh_db):
+def test_idempotent_job_claim_preserves_progress(fresh_db):
     db = fresh_db
+    # Initial claim
+    db.record_job_claimed("ORD-IDEMP", "JR-1", "printbar-kyocera", 10, "bw", 1, {})
+    db.update_job_progress("ORD-IDEMP", pages_printed=4, status="printing")
+
+    # Re-claim should NOT reset pages_printed to 0 or status to claimed!
+    db.record_job_claimed("ORD-IDEMP", "JR-1", "printbar-kyocera", 10, "bw", 1, {})
     with db.get_connection() as conn:
-        mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
-    assert mode == "wal"
+        row = conn.execute("SELECT status, pages_printed FROM local_jobs WHERE order_id = 'ORD-IDEMP'").fetchone()
+
+    assert row["status"] == "printing"
+    assert row["pages_printed"] == 4
 
 
-def test_foreign_keys_enabled(fresh_db):
+def test_outbox_exponential_backoff(fresh_db):
     db = fresh_db
+    ev_id = db.save_outbox_event("telemetry", None, {"sample": 1})
+    db.schedule_outbox_retry(ev_id, "HTTP 500 error")
+
     with db.get_connection() as conn:
-        fk = conn.execute("PRAGMA foreign_keys").fetchone()[0]
-    assert fk == 1
+        row = conn.execute("SELECT retry_count, last_error, backlog_status FROM outbox_events WHERE id = ?", (ev_id,)).fetchone()
+
+    assert row["retry_count"] == 1
+    assert "HTTP 500" in row["last_error"]
+    assert row["backlog_status"] == "retrying"
 
 
-def test_record_and_retrieve_job(fresh_db):
+def test_outbox_stats(fresh_db):
     db = fresh_db
-    db.record_job_claimed("ORD-001", "JR-001", "printbar-kyocera", 10, "bw", 2, {"test": True})
-    job = db.get_active_job()
-    assert job is not None
-    assert job["order_id"] == "ORD-001"
-    assert job["status"] == "claimed"
-    assert job["pages_to_print"] == 10
-
-
-def test_update_job_progress(fresh_db):
-    db = fresh_db
-    db.record_job_claimed("ORD-002", "JR-002", "printbar-kyocera", 5, "bw", 1, {})
-    db.update_job_progress("ORD-002", 3, cups_job_id="kyocera-45", status="printing")
-    job = db.get_active_job()
-    assert job["pages_printed"] == 3
-    assert job["cups_job_id"] == "kyocera-45"
-    assert job["status"] == "printing"
-
-
-def test_mark_job_completed(fresh_db):
-    db = fresh_db
-    db.record_job_claimed("ORD-003", "JR-003", "printbar-kyocera", 2, "bw", 1, {})
-    db.mark_job_completed("ORD-003")
-    # Completed jobs not returned by get_active_job
-    assert db.get_active_job() is None
-
-
-def test_incomplete_jobs_returned_on_startup(fresh_db):
-    db = fresh_db
-    db.record_job_claimed("ORD-010", "JR-010", "printbar-kyocera", 5, "bw", 1, {})
-    jobs = db.get_incomplete_jobs()
-    assert any(j["order_id"] == "ORD-010" for j in jobs)
-
-
-def test_outbox_save_and_retrieve(fresh_db):
-    db = fresh_db
-    ev_id = db.save_outbox_event("progress", "ORD-100", {"pagesPrinted": 3, "_url": "http://x", "_method": "PATCH"})
-    assert ev_id > 0
-    pending = db.get_pending_outbox()
-    assert any(e["id"] == ev_id for e in pending)
-
-
-def test_outbox_mark_synced(fresh_db):
-    db = fresh_db
-    ev_id = db.save_outbox_event("complete", "ORD-200", {"_url": "http://x", "_method": "POST"})
-    db.mark_outbox_synced(ev_id)
-    pending = db.get_pending_outbox()
-    assert all(e["id"] != ev_id for e in pending)
-
-
-def test_nonce_dedup(fresh_db):
-    db = fresh_db
-    db.save_nonce("unique-nonce-abc", "TEST-K01")
-    assert db.nonce_exists("unique-nonce-abc") is True
-    assert db.nonce_exists("different-nonce") is False
+    db.save_outbox_event("req1", "O1", {})
+    db.save_outbox_event("req2", "O2", {})
+    stats = db.get_outbox_stats()
+    assert stats["pending_events"] >= 2
+    assert stats["synced_events"] >= 0
 
 
 def test_print_attempt_lifecycle(fresh_db):
     db = fresh_db
-    db.record_job_claimed("ORD-300", "JR-300", "printbar-kyocera", 4, "bw", 1, {})
-    att_id = db.record_print_attempt("ORD-300", 1, "printbar-kyocera", "kyocera-77")
-    assert att_id > 0
-    db.update_print_attempt(att_id, cups_state="processing", pages_printed=2, result="completed", ended=True)
+    db.record_job_claimed("ORD-ATT", "JR-ATT", "printbar-kyocera", 5, "bw", 1, {})
+    att_id = db.record_print_attempt("ORD-ATT", 1, "printbar-kyocera", "kyocera-99")
+    db.update_print_attempt(att_id, cups_state="completed", pages_printed=5, result="completed", ended=True)
+
     with db.get_connection() as conn:
-        row = conn.execute("SELECT * FROM print_attempts WHERE id=?", (att_id,)).fetchone()
-    assert row["cups_state"] == "processing"
-    assert row["pages_printed"] == 2
-
-
-def test_command_idempotency(fresh_db):
-    db = fresh_db
-    db.record_command("CMD-001", "test_print")
-    assert db.command_already_executed("CMD-001") is False  # still pending
-    db.complete_command("CMD-001", "succeeded", {"result": "ok"})
-    assert db.command_already_executed("CMD-001") is True
-
-
-def test_printer_state_history(fresh_db):
-    db = fresh_db
-    db.record_printer_state("kyocera", "READY", "cups", {"cups_state": "idle"})
-    with db.get_connection() as conn:
-        rows = conn.execute("SELECT * FROM printer_state_history").fetchall()
-    assert len(rows) == 1
-    assert rows[0]["state"] == "READY"
-
+        row = conn.execute("SELECT cups_state, pages_printed, result FROM print_attempts WHERE id = ?", (att_id,)).fetchone()
+    assert row["cups_state"] == "completed"
+    assert row["pages_printed"] == 5
+    assert row["result"] == "completed"

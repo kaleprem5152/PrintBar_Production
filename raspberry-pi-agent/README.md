@@ -17,8 +17,8 @@ The agent runs as a background systemd service on a Raspberry Pi 5 (8GB) connect
    - Dual-telemetry heartbeats (`/api/device/heartbeat` and `/api/agent/heartbeat`).
    - Remote command execution via Admin Control Centre (test prints, queue clearing, paper refills, service restarts).
    - Atomic job claiming with idempotency keys.
-   - Dual-printer routing with seamless partial failover (resumes from exact unprinted page range — zero duplicate sheets).
-   - Forensic 3-pass document shredding (`\x00`, `\xff`, `\xa5`) upon job completion or failure.
+   - Capability-validated pre-flight routing between Kyocera PA3500x and Canon GX6170. Mid-print interruptions are safely flagged for manual review to prevent duplicate printing.
+   - Secure customer document cleanup with file overwrite and reliable unlinking.
    - Paper inventory enforcement (250-sheet trays per printer).
 
 2. **Unified Printer Monitoring (`printer_monitor.py`)**:
@@ -92,3 +92,4 @@ To view live service logs:
 ```bash
 sudo journalctl -u printbar-agent -f
 ```
+

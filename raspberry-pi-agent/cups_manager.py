@@ -2,7 +2,12 @@
 CUPS Printer Manager for PrintBar Raspberry Pi Agent.
 Manages Kyocera ECOSYS PA3500x (Primary B&W) and Canon MAXIFY GX6170 (Color & B&W Fallback).
 Supports authentic page-level progress monitoring, hardware status checks, queue flushing,
-test page generation, and precise partial-page failover routing.
+test page generation, and precise printer-option routing.
+
+STRICT PRODUCTION RULES:
+- Zero simulation or mock code.
+- If CUPS executables (lp, lpstat, cancel) are missing, return explicit errors.
+- Never invent 'sim-*' job IDs or fabricate readiness.
 """
 import subprocess
 import re
@@ -15,6 +20,7 @@ from config import KYOCERA_QUEUE, CANON_QUEUE
 
 logger = logging.getLogger("printbar.cups")
 
+
 class CupsManager:
     def __init__(self):
         self.kyocera_queue = KYOCERA_QUEUE
@@ -22,52 +28,79 @@ class CupsManager:
 
     def check_printer_status(self) -> Dict[str, Any]:
         """
-        Check CUPS status for both physical printers using lpstat.
+        Check authentic CUPS status for both physical printers using lpstat.
         Returns a dict with readiness flags and raw details.
+        No simulation: missing lpstat or missing queues report explicitly not ready.
         """
         status = {
-            "cups_reachable": True,
-            "kyocera_ready": True,
-            "canon_ready": True,
-            "kyocera_status": "idle",
-            "canon_status": "idle",
-            "paper_ready": True,
+            "cups_reachable": False,
+            "kyocera_ready": False,
+            "canon_ready": False,
+            "kyocera_status": "unknown",
+            "canon_status": "unknown",
+            "paper_ready": False,
             "toner_ok": True,
+            "error": None,
         }
 
         try:
             res = subprocess.run(["lpstat", "-p"], capture_output=True, text=True, timeout=5)
             if res.returncode == 0:
+                status["cups_reachable"] = True
                 output = res.stdout.lower()
-                # Check Kyocera
+
+                # Check Kyocera queue
                 if self.kyocera_queue.lower() in output:
-                    k_match = re.search(rf"printer {self.kyocera_queue.lower()} (is idle|is printing|is disabled)", output)
+                    k_match = re.search(
+                        rf"printer {re.escape(self.kyocera_queue.lower())} (is idle|is printing|is disabled)",
+                        output,
+                    )
                     if k_match:
                         k_state = k_match.group(1)
                         status["kyocera_status"] = k_state
-                        if "disabled" in k_state:
-                            status["kyocera_ready"] = False
+                        status["kyocera_ready"] = "disabled" not in k_state
                     else:
+                        status["kyocera_status"] = "unknown"
                         status["kyocera_ready"] = False
+                else:
+                    status["kyocera_status"] = "queue_missing"
+                    status["kyocera_ready"] = False
 
-                # Check Canon
+                # Check Canon queue
                 if self.canon_queue.lower() in output:
-                    c_match = re.search(rf"printer {self.canon_queue.lower()} (is idle|is printing|is disabled)", output)
+                    c_match = re.search(
+                        rf"printer {re.escape(self.canon_queue.lower())} (is idle|is printing|is disabled)",
+                        output,
+                    )
                     if c_match:
                         c_state = c_match.group(1)
                         status["canon_status"] = c_state
-                        if "disabled" in c_state:
-                            status["canon_ready"] = False
+                        status["canon_ready"] = "disabled" not in c_state
                     else:
+                        status["canon_status"] = "unknown"
                         status["canon_ready"] = False
+                else:
+                    status["canon_status"] = "queue_missing"
+                    status["canon_ready"] = False
+
+                # Both or either ready
+                status["paper_ready"] = status["kyocera_ready"] or status["canon_ready"]
             else:
                 status["cups_reachable"] = False
-                logger.warning(f"lpstat -p returned non-zero ({res.returncode}): {res.stderr}")
+                status["error"] = f"lpstat returned non-zero ({res.returncode}): {res.stderr.strip()}"
+                logger.warning(status["error"])
+
         except FileNotFoundError:
-            # lpstat not installed on dev machine — simulate ready
-            status["cups_reachable"] = True
-            logger.debug("lpstat command not found. Simulating printers ready for dev environment.")
+            status["cups_reachable"] = False
+            status["error"] = "CUPS client binary (lpstat) not installed on host"
+            logger.error(status["error"])
+        except subprocess.TimeoutExpired:
+            status["cups_reachable"] = False
+            status["error"] = "lpstat command timed out after 5s"
+            logger.error(status["error"])
         except Exception as e:
+            status["cups_reachable"] = False
+            status["error"] = str(e)
             logger.error(f"Error checking printer status: {e}")
 
         return status
@@ -82,14 +115,23 @@ class CupsManager:
         sides: str = "single",
         orientation: str = "portrait",
         page_range: Optional[str] = None,
+        number_up: int = 1,
     ) -> Tuple[bool, Optional[str], Optional[str]]:
         """
         Submit a document to the specified CUPS printer queue.
-        Supports page_range (e.g. '3-10') for seamless partial-failover resumption.
+        Validates capabilities before submission.
         Returns (success: bool, cups_job_id: Optional[str], error_message: Optional[str])
         """
         if not os.path.isfile(file_path):
             return False, None, f"File does not exist: {file_path}"
+
+        # Capability validation: Kyocera PA3500x is strictly monochrome
+        if color_mode == "color" and printer_queue == self.kyocera_queue:
+            return (
+                False,
+                None,
+                f"Queue '{printer_queue}' is monochrome only and does not support colour printing.",
+            )
 
         cmd = ["lp", "-d", printer_queue]
 
@@ -117,31 +159,48 @@ class CupsManager:
         else:
             cmd.extend(["-o", "print-color-mode=monochrome"])
 
-        # Optional page range for failover / partial printing
+        # N-up (pages per sheet)
+        if number_up and number_up > 1:
+            if number_up in (2, 4, 6, 9, 16):
+                cmd.extend(["-o", f"number-up={number_up}"])
+            else:
+                return (
+                    False,
+                    None,
+                    f"Unsupported N-up value: {number_up}. Supported options: 1, 2, 4, 6, 9, 16.",
+                )
+
+        # Optional page range
         if page_range:
             cmd.extend(["-o", f"page-ranges={page_range}"])
 
         cmd.append(file_path)
 
-        logger.info(f"Submitting CUPS job: {' '.join(cmd)}")
+        logger.info(f"Submitting authentic CUPS job: {' '.join(cmd)}")
 
         try:
             res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
             if res.returncode == 0:
-                # Output like: "request id is Kyocera_PA3500x-105 (1 file(s))"
                 match = re.search(r"request id is ([^\s]+)", res.stdout)
-                cups_job_id = match.group(1) if match else "cups-job-submitted"
-                logger.info(f"CUPS job successfully submitted: {cups_job_id}")
-                return True, cups_job_id, None
+                if match:
+                    cups_job_id = match.group(1)
+                    logger.info(f"CUPS accepted job: {cups_job_id}")
+                    return True, cups_job_id, None
+                logger.warning(f"Could not parse CUPS job ID from output: {res.stdout}")
+                return True, "unknown_job_id", None
             else:
-                err = res.stderr.strip() or f"lp exited with code {res.returncode}"
-                logger.error(f"CUPS submission failed: {err}")
-                return False, None, err
+                error_msg = res.stderr.strip() or f"lp exited with code {res.returncode}"
+                logger.error(f"CUPS print failure: {error_msg}")
+                return False, None, error_msg
+
         except FileNotFoundError:
-            # lp not found (development environment simulation)
-            sim_id = f"sim-{printer_queue}-{os.path.basename(file_path)[:8]}"
-            logger.info(f"[DEV SIMULATION] Simulated CUPS job: {sim_id}")
-            return True, sim_id, None
+            err = "CUPS client binary (lp) not found. System printing packages not installed."
+            logger.critical(err)
+            return False, None, err
+        except subprocess.TimeoutExpired:
+            err = "CUPS submission (lp) timed out after 15s"
+            logger.error(err)
+            return False, None, err
         except Exception as e:
             logger.error(f"Exception during print submission: {e}")
             return False, None, str(e)
@@ -195,18 +254,18 @@ class CupsManager:
                 for line in res.stdout.strip().split("\n"):
                     if not line.strip():
                         continue
-                    # Format: Queue_Name-123 user 1024 Thu 01 Jan 2026 ...
                     parts = line.split()
                     if parts:
-                        job_id = parts[0]
-                        queue_jobs.append({
-                            "job_id": job_id,
-                            "user": parts[1] if len(parts) > 1 else "unknown",
-                            "size": parts[2] if len(parts) > 2 else "unknown",
-                            "raw": line.strip(),
-                        })
+                        queue_jobs.append(
+                            {
+                                "job_id": parts[0],
+                                "user": parts[1] if len(parts) > 1 else "",
+                                "size": parts[2] if len(parts) > 2 else "",
+                                "raw": line,
+                            }
+                        )
         except Exception as e:
-            logger.debug(f"Could not fetch CUPS queue: {e}")
+            logger.error(f"Error reading CUPS queue: {e}")
         return queue_jobs
 
     def clear_stuck_jobs(self, printer_queue: Optional[str] = None) -> bool:
@@ -228,7 +287,12 @@ class CupsManager:
         Restart the local CUPS service via systemctl.
         """
         try:
-            res = subprocess.run(["sudo", "systemctl", "restart", "cups"], capture_output=True, text=True, timeout=10)
+            res = subprocess.run(
+                ["sudo", "systemctl", "restart", "cups"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
             if res.returncode == 0:
                 return True, "CUPS service restarted successfully."
             return False, res.stderr.strip() or f"systemctl exited with {res.returncode}"
@@ -258,10 +322,10 @@ class CupsManager:
             "verified": False,
         }
 
-        if not cups_job_id:
+        if not cups_job_id or cups_job_id == "unknown_job_id":
             return result
 
-        # Check PyCUPS if installed
+        # 1. Try PyCUPS if installed
         try:
             import importlib
             cups = importlib.import_module("cups")
@@ -291,12 +355,13 @@ class CupsManager:
         except (ImportError, ValueError, Exception):
             pass
 
-        # Check via lpstat CLI
+        # 2. Check via lpstat CLI
         try:
-            res = subprocess.run(["lpstat", "-l", cups_job_id], capture_output=True, text=True, timeout=5)
+            res = subprocess.run(
+                ["lpstat", "-l", cups_job_id], capture_output=True, text=True, timeout=5
+            )
             if res.returncode == 0:
                 output = res.stdout.lower()
-                # Search for impressions
                 impr_match = re.search(r"job-impressions-completed[:=]\s*(\d+)", output)
                 if impr_match:
                     result["impressions_completed"] = int(impr_match.group(1))
@@ -305,7 +370,6 @@ class CupsManager:
                 if sheets_match:
                     result["sheets_completed"] = int(sheets_match.group(1))
 
-                # Strip out completed attribute keys so 'job-impressions-completed' doesn't false-trigger
                 status_text = re.sub(r"job-[a-z0-9\-]+-completed", "", output)
                 if re.search(r"\b(completed|finished)\b", status_text):
                     result["state"] = "completed"
@@ -326,20 +390,23 @@ class CupsManager:
                 result["verified"] = True
                 return result
             else:
-                # Job not found in active list — check completed jobs
-                comp_res = subprocess.run(["lpstat", "-W", "completed", "-l", cups_job_id], capture_output=True, text=True, timeout=5)
+                # Job not in active list — check completed history
+                comp_res = subprocess.run(
+                    ["lpstat", "-W", "completed", "-l", cups_job_id],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
                 if comp_res.returncode == 0 and comp_res.stdout:
                     result["state"] = "completed"
                     result["is_active"] = False
                     result["verified"] = True
                     return result
         except FileNotFoundError:
-            # lpstat not on dev host
-            if cups_job_id.startswith("sim-"):
-                result["state"] = "completed"
-                result["is_active"] = False
-                result["verified"] = False
-                return result
+            result["state"] = "unknown"
+            result["is_active"] = False
+            result["verified"] = False
+            return result
         except Exception as e:
             logger.debug(f"Could not read lpstat progress for {cups_job_id}: {e}")
 

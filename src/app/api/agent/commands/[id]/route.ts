@@ -7,7 +7,7 @@ import { agentAuth } from "@/lib/agent";
 export const dynamic = "force-dynamic";
 
 export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
-  const denied = agentAuth(req);
+  const denied = await agentAuth(req);
   if (denied) return denied;
   const { id } = await ctx.params;
   const b = (await req.json().catch(() => ({}))) as { status?: string; result?: string };

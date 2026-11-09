@@ -67,7 +67,7 @@ def test_execute_remote_command_refill(agent):
         "payload": {"printer": "both", "amount": 250},
     }
 
-    with patch.object(agent, "_acknowledge_command") as mock_ack:
+    with patch.object(agent, "_acknowledge_command", return_value=True) as mock_ack:
         agent._execute_command(cmd)
         assert agent.kyocera_paper == 250
         assert agent.canon_paper == 250
@@ -84,7 +84,7 @@ def test_execute_remote_command_test_print(agent):
     }
 
     with patch.object(agent.cups, "print_test_page", return_value=(True, "test-job-99", None)):
-        with patch.object(agent, "_acknowledge_command") as mock_ack:
+        with patch.object(agent, "_acknowledge_command", return_value=True) as mock_ack:
             agent._execute_command(cmd)
             mock_ack.assert_called_once()
             assert mock_ack.call_args[0][1] == "succeeded"
@@ -108,3 +108,4 @@ def test_heartbeat_payload_generation(agent):
         assert agent.kyocera_paper == 240
         assert agent.last_heartbeat_time > 0
         assert mock_post.call_count >= 1
+
