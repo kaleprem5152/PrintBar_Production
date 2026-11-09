@@ -1,12 +1,16 @@
 """
 CUPS Printer Manager for PrintBar Raspberry Pi Agent.
 Manages Kyocera ECOSYS PA3500x (Primary B&W) and Canon MAXIFY GX6170 (Color & B&W Fallback).
+Supports authentic page-level progress monitoring, hardware status checks, queue flushing,
+test page generation, and precise partial-page failover routing.
 """
 import subprocess
 import re
 import os
+import tempfile
+import time
 import logging
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
 from config import KYOCERA_QUEUE, CANON_QUEUE
 
 logger = logging.getLogger("printbar.cups")
@@ -45,7 +49,7 @@ class CupsManager:
                             status["kyocera_ready"] = False
                     else:
                         status["kyocera_ready"] = False
-                
+
                 # Check Canon
                 if self.canon_queue.lower() in output:
                     c_match = re.search(rf"printer {self.canon_queue.lower()} (is idle|is printing|is disabled)", output)
@@ -77,9 +81,11 @@ class CupsManager:
         paper_size: str = "A4",
         sides: str = "single",
         orientation: str = "portrait",
+        page_range: Optional[str] = None,
     ) -> Tuple[bool, Optional[str], Optional[str]]:
         """
         Submit a document to the specified CUPS printer queue.
+        Supports page_range (e.g. '3-10') for seamless partial-failover resumption.
         Returns (success: bool, cups_job_id: Optional[str], error_message: Optional[str])
         """
         if not os.path.isfile(file_path):
@@ -111,6 +117,10 @@ class CupsManager:
         else:
             cmd.extend(["-o", "print-color-mode=monochrome"])
 
+        # Optional page range for failover / partial printing
+        if page_range:
+            cmd.extend(["-o", f"page-ranges={page_range}"])
+
         cmd.append(file_path)
 
         logger.info(f"Submitting CUPS job: {' '.join(cmd)}")
@@ -135,6 +145,95 @@ class CupsManager:
         except Exception as e:
             logger.error(f"Exception during print submission: {e}")
             return False, None, str(e)
+
+    def print_test_page(self, printer_queue: str) -> Tuple[bool, Optional[str], Optional[str]]:
+        """
+        Generates and submits a genuine test page to the requested printer queue.
+        """
+        temp_dir = tempfile.gettempdir()
+        test_file = os.path.join(temp_dir, f"printbar_test_{printer_queue}_{int(time.time())}.txt")
+        try:
+            timestamp = time.strftime("%Y-%m-%d %H:%M:%S IST")
+            with open(test_file, "w") as f:
+                f.write("=========================================\n")
+                f.write("       PRINTBAR KIOSK TEST PAGE          \n")
+                f.write("  Location: SGU Food Court, Kolhapur     \n")
+                f.write("=========================================\n\n")
+                f.write(f"Target Queue: {printer_queue}\n")
+                f.write(f"Timestamp:    {timestamp}\n")
+                f.write("Status:       Hardware Diagnostics Verification\n")
+                f.write("Status:       OK - CUPS Pipeline Functional\n\n")
+                f.write("=========================================\n")
+
+            return self.print_file(
+                file_path=test_file,
+                printer_queue=printer_queue,
+                copies=1,
+                color_mode="bw",
+                paper_size="A4",
+                sides="single",
+                orientation="portrait",
+            )
+        finally:
+            if os.path.exists(test_file):
+                try:
+                    os.remove(test_file)
+                except Exception:
+                    pass
+
+    def get_cups_queue(self, printer_queue: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        Query CUPS for pending jobs in the queue.
+        """
+        queue_jobs = []
+        try:
+            cmd = ["lpstat", "-o"]
+            if printer_queue:
+                cmd.append(printer_queue)
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+            if res.returncode == 0 and res.stdout:
+                for line in res.stdout.strip().split("\n"):
+                    if not line.strip():
+                        continue
+                    # Format: Queue_Name-123 user 1024 Thu 01 Jan 2026 ...
+                    parts = line.split()
+                    if parts:
+                        job_id = parts[0]
+                        queue_jobs.append({
+                            "job_id": job_id,
+                            "user": parts[1] if len(parts) > 1 else "unknown",
+                            "size": parts[2] if len(parts) > 2 else "unknown",
+                            "raw": line.strip(),
+                        })
+        except Exception as e:
+            logger.debug(f"Could not fetch CUPS queue: {e}")
+        return queue_jobs
+
+    def clear_stuck_jobs(self, printer_queue: Optional[str] = None) -> bool:
+        """
+        Cancel stuck or pending jobs in the specified printer queue or all queues.
+        """
+        try:
+            cmd = ["cancel", "-a"]
+            if printer_queue:
+                cmd.append(printer_queue)
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+            return res.returncode == 0
+        except Exception as e:
+            logger.error(f"Error clearing stuck jobs: {e}")
+            return False
+
+    def restart_cups(self) -> Tuple[bool, str]:
+        """
+        Restart the local CUPS service via systemctl.
+        """
+        try:
+            res = subprocess.run(["sudo", "systemctl", "restart", "cups"], capture_output=True, text=True, timeout=10)
+            if res.returncode == 0:
+                return True, "CUPS service restarted successfully."
+            return False, res.stderr.strip() or f"systemctl exited with {res.returncode}"
+        except Exception as e:
+            return False, str(e)
 
     def cancel_job(self, cups_job_id: str) -> bool:
         """Cancel a CUPS job by ID"""
@@ -162,7 +261,7 @@ class CupsManager:
         if not cups_job_id:
             return result
 
-        # Check PyCUPS if installed (dynamic import ensures compatibility across environments without IDE unresolved import errors)
+        # Check PyCUPS if installed
         try:
             import importlib
             cups = importlib.import_module("cups")

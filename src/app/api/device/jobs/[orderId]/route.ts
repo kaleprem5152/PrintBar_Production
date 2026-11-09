@@ -9,7 +9,7 @@ import { and, eq } from "drizzle-orm";
 import { db } from "@/db";
 import { devices, orders, devicePrintJobs } from "@/db/schema";
 import { authenticateDevice } from "@/lib/server/device-auth";
-import { logAuditEvent } from "@/lib/server/orders";
+import { logAuditEvent, syncOrderToPrintJob } from "@/lib/server/orders";
 import { cleanupOrderFiles } from "@/lib/server/files";
 import { calculateRefundAmount, executeOrderRefund } from "@/lib/server/refunds";
 
@@ -46,6 +46,7 @@ export async function PATCH(req: Request, ctx: Params) {
   }
 
   await db.update(orders).set(updates).where(eq(orders.orderId, orderId));
+  await syncOrderToPrintJob(orderId);
 
   return Response.json({ ok: true });
 }
@@ -158,6 +159,8 @@ export async function POST(req: Request, ctx: Params) {
       details:   { docCount: (order.docs as any[])?.length || 0 },
     });
 
+    await syncOrderToPrintJob(orderId);
+
     return Response.json({ ok: true, status: "completed" });
   }
 
@@ -223,6 +226,8 @@ export async function POST(req: Request, ctx: Params) {
       details:   { reason, pagesPrinted: actualPagesPrinted, cupsJobId, refundStatus, refundableAmount: refundCalc.refundableAmount },
     });
 
+    await syncOrderToPrintJob(orderId);
+
     return Response.json({ ok: true, status: "failed", refundStatus, refundableAmount: refundCalc.refundableAmount });
   }
 
@@ -267,6 +272,8 @@ export async function POST(req: Request, ctx: Params) {
       deviceId:  auth.deviceId,
       details:   { reason, pagesPrinted, previousCupsJobId },
     });
+
+    await syncOrderToPrintJob(orderId);
 
     return Response.json({
       ok:           true,

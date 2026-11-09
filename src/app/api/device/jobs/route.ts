@@ -8,7 +8,7 @@ import { randomBytes } from "crypto";
 import { db } from "@/db";
 import { orders, devicePrintJobs } from "@/db/schema";
 import { authenticateDevice } from "@/lib/server/device-auth";
-import { logAuditEvent } from "@/lib/server/orders";
+import { logAuditEvent, syncOrderToPrintJob } from "@/lib/server/orders";
 
 export const dynamic = "force-dynamic";
 
@@ -101,6 +101,8 @@ export async function POST(req: Request) {
     deviceId,
     details:   { jobRef, printerName: claimed.colorMode === "color" ? "canon_gx6170" : "kyocera_pa3500x" },
   });
+
+  await syncOrderToPrintJob(claimed);
 
   return Response.json({
     ok:      true,

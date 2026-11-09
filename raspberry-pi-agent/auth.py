@@ -29,4 +29,5 @@ def get_auth_headers() -> Dict[str, str]:
         "x-device-ts": ts,
         "x-device-nonce": nonce,
         "x-device-token": signature,
+        "x-agent-key": DEVICE_AUTH_SECRET,
     }

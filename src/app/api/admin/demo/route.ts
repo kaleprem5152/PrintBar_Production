@@ -8,6 +8,11 @@ export const POST = route("users.manage", async ({ user, ip, body }) => {
   const b = await body();
   const action = oneOf(b.action, "action", ["load", "clear"] as const);
   if (b.confirm !== true) throw new ApiError(400, "Confirmation required");
+
+  if (process.env.NODE_ENV === "production" && action === "load") {
+    throw new ApiError(403, "Demo dataset loading is strictly disabled in production. Only genuine SGU kiosk records are permitted.");
+  }
+
   if (action === "clear") {
     await clearDemo();
     await setSetting("demo_seeded", true);

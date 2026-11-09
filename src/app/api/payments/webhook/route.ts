@@ -19,7 +19,7 @@ import { and, eq } from "drizzle-orm";
 import { db } from "@/db";
 import { orders, paymentTransactions, refundTransactions } from "@/db/schema";
 import { verifyCashfreeWebhookSignature } from "@/lib/server/cashfree";
-import { generatePin, hashPin, logAuditEvent } from "@/lib/server/orders";
+import { generatePin, hashPin, logAuditEvent, syncOrderToPrintJob } from "@/lib/server/orders";
 import { PIN_TTL_HOURS } from "@/lib/config";
 
 export const dynamic = "force-dynamic";
@@ -121,6 +121,7 @@ export async function POST(req: Request) {
             .where(eq(refundTransactions.cashfreeRefundId, cfRefundId));
         }
       }
+      await syncOrderToPrintJob(refOrderId);
     }
 
     return new Response("ok", { status: 200 });
@@ -233,6 +234,8 @@ export async function POST(req: Request) {
         details:   { cfPaymentId, amount: paymentAmount, method: extractMethodName(paymentMethod) },
       });
 
+      await syncOrderToPrintJob(internalOrderId);
+
       console.log(`[webhook] Payment SUCCESS for ${internalOrderId} — PIN issued, order queued`);
     } catch (err) {
       console.error(`[webhook] Failed to process payment for ${internalOrderId}:`, err);
@@ -271,6 +274,8 @@ export async function POST(req: Request) {
         orderId:   internalOrderId,
         details:   { cfPaymentId, paymentStatus },
       });
+
+      await syncOrderToPrintJob(internalOrderId);
     } catch (err) {
       console.error(`[webhook] Failed to record payment failure for ${internalOrderId}:`, err);
     }

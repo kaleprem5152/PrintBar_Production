@@ -2,7 +2,7 @@ import "server-only";
 import { createHmac, randomBytes } from "crypto";
 import { and, desc, eq, gt, inArray, or } from "drizzle-orm";
 import { db } from "@/db";
-import { auditEvents, devices, orders, type OrderDoc } from "@/db/schema";
+import { auditEvents, devices, orders, payments, printJobs, type OrderDoc } from "@/db/schema";
 import { PIN_TTL_HOURS } from "@/lib/config";
 
 export type OrderRow = typeof orders.$inferSelect;
@@ -25,6 +25,127 @@ export function newOrderRef(id: number) {
 
 export function expiryFromNow() {
   return new Date(Date.now() + PIN_TTL_HOURS * 3600 * 1000);
+}
+
+// ─── Bidirectional Sync with Admin Dashboard Schema ──────────────────────────
+
+/**
+ * Synchronizes an order row into authoritative admin `printJobs` and `payments` tables.
+ * Guarantees zero discrepancy between customer-facing orders and admin control centre.
+ */
+export async function syncOrderToPrintJob(orderOrId: string | OrderRow): Promise<void> {
+  try {
+    let o: OrderRow | null = null;
+    if (typeof orderOrId === "string") {
+      const [row] = await db.select().from(orders).where(eq(orders.orderId, orderOrId));
+      o = row ?? null;
+    } else {
+      o = orderOrId;
+    }
+    if (!o) return;
+
+    const docs = (Array.isArray(o.docs) ? o.docs : []) as OrderDoc[];
+    const fileName = docs[0]?.name || "Document.pdf";
+    const amountPaise = o.amountPaise ?? Math.round(o.amount * 100);
+
+    let pjStatus = "created";
+    if (o.status === "completed") pjStatus = "completed";
+    else if (o.status === "failed") pjStatus = "failed";
+    else if (o.status === "cancelled") pjStatus = "cancelled";
+    else if (o.status === "printing" || o.status === "fallback_printing") pjStatus = "printing";
+    else if (o.status === "claimed" || o.status === "processing") pjStatus = "claimed";
+    else if (["paid", "pin_accepted", "queued"].includes(o.status)) pjStatus = "queued";
+    else if (o.status === "payment_failed") pjStatus = "failed";
+
+    let payStatus = "pending";
+    if (["paid", "pin_accepted", "queued", "claimed", "processing", "printing", "completed"].includes(o.status)) {
+      payStatus = "success";
+    } else if (o.status === "payment_failed") {
+      payStatus = "failed";
+    } else if (o.status === "refunded") {
+      payStatus = "refunded";
+    }
+
+    const printerId = o.printerUsed || (o.colorMode === "color" ? "canon_gx6170" : "kyocera_pa3500x");
+
+    await db
+      .insert(printJobs)
+      .values({
+        id: o.orderId,
+        customerRef: o.token || o.orderId,
+        fileName,
+        pages: o.pagesToPrint || 1,
+        colorMode: o.colorMode || "bw",
+        sided: o.sides || "single",
+        pagesPerSheet: o.pagesPerSheet ?? 1,
+        copies: o.copies ?? 1,
+        amountPaise,
+        paymentStatus: payStatus,
+        status: pjStatus,
+        kioskId: "PB-K01",
+        printerId,
+        pagesPrinted: o.pagesPrinted || 0,
+        errorCode: o.failureReason || null,
+        errorMessage: o.failureReason || null,
+        retryCount: 0,
+        documentDeletedAt: o.filesDeletedAt || null,
+        createdAt: o.createdAt || new Date(),
+        updatedAt: o.updatedAt || new Date(),
+      })
+      .onConflictDoUpdate({
+        target: printJobs.id,
+        set: {
+          customerRef: o.token || o.orderId,
+          fileName,
+          pages: o.pagesToPrint || 1,
+          colorMode: o.colorMode || "bw",
+          sided: o.sides || "single",
+          pagesPerSheet: o.pagesPerSheet ?? 1,
+          copies: o.copies ?? 1,
+          amountPaise,
+          paymentStatus: payStatus,
+          status: pjStatus,
+          kioskId: "PB-K01",
+          printerId,
+          pagesPrinted: o.pagesPrinted || 0,
+          errorCode: o.failureReason || null,
+          errorMessage: o.failureReason || null,
+          documentDeletedAt: o.filesDeletedAt || null,
+          updatedAt: o.updatedAt || new Date(),
+        },
+      });
+
+    const cfOrderId = o.cashfreeOrderId || o.orderId;
+    if (payStatus === "success" || o.cashfreePaymentId) {
+      await db
+        .insert(payments)
+        .values({
+          jobId: o.orderId,
+          orderId: cfOrderId,
+          transactionId: o.cashfreePaymentId || null,
+          amountPaise,
+          feePaise: 0,
+          method: o.paymentMethod || "upi",
+          status: payStatus,
+          refundedPaise: o.refundedAmount ? Math.round(o.refundedAmount * 100) : 0,
+          failureReason: o.failureReason || null,
+          createdAt: o.createdAt || new Date(),
+          paidAt: payStatus === "success" ? (o.paidAt || o.createdAt || new Date()) : null,
+        })
+        .onConflictDoUpdate({
+          target: payments.orderId,
+          set: {
+            transactionId: o.cashfreePaymentId || null,
+            amountPaise,
+            status: payStatus,
+            refundedPaise: o.refundedAmount ? Math.round(o.refundedAmount * 100) : 0,
+            paidAt: payStatus === "success" ? (o.paidAt || o.createdAt || new Date()) : null,
+          },
+        });
+    }
+  } catch (err) {
+    console.error(`[syncOrderToPrintJob] Error syncing order:`, err);
+  }
 }
 
 // ─── In-Memory Fallback Store (Only for Dev / Isolated Demo) ───────────────────
@@ -546,7 +667,9 @@ export async function createOrderRecord(data: {
       .where(eq(orders.id, inserted.id))
       .returning();
 
-    return finalRow ?? { ...inserted, orderId };
+    const result = finalRow ?? { ...inserted, orderId };
+    await syncOrderToPrintJob(result);
+    return result;
   } catch (err) {
     if (process.env.NODE_ENV === "production" && !isDemo) {
       console.error("[orders] Database failure creating production order:", err);
@@ -679,7 +802,10 @@ export async function updateOrderPaymentState(params: {
       })
       .where(eq(orders.orderId, params.orderId))
       .returning();
-    if (u) return u;
+    if (u) {
+      await syncOrderToPrintJob(u);
+      return u;
+    }
   } catch (err) {
     if (process.env.NODE_ENV === "production") {
       console.error("[orders] Database error in updateOrderPaymentState:", err);
@@ -717,13 +843,17 @@ export async function markOrderPaid(params: {
         pinAttempts: 0,
         pinLockedUntil: null,
         cashfreePaymentId: params.paymentId,
+        paymentMethod: params.paymentMethod ?? "upi",
         paidAt: now,
         expiresAt,
         updatedAt: now,
       })
       .where(eq(orders.orderId, params.orderId))
       .returning();
-    if (u) return u;
+    if (u) {
+      await syncOrderToPrintJob(u);
+      return u;
+    }
   } catch (err) {
     if (process.env.NODE_ENV === "production") {
       console.error("[orders] Database error in markOrderPaid:", err);
@@ -820,7 +950,10 @@ export async function updateOrderStatus(orderId: string, status: typeof orders.$
       .set({ status, updatedAt: new Date() })
       .where(eq(orders.orderId, orderId))
       .returning();
-    if (u) return u;
+    if (u) {
+      await syncOrderToPrintJob(u);
+      return u;
+    }
   } catch (err) {
     if (process.env.NODE_ENV === "production") {
       console.error("[orders] Database error in updateOrderStatus:", err);

@@ -4,7 +4,7 @@ import { and, desc, eq } from "drizzle-orm";
 import { db } from "@/db";
 import { orders, refundTransactions, type OrderRow } from "@/db/schema";
 import { createCashfreeRefund, getCashfreeRefundStatus } from "./cashfree";
-import { logAuditEvent } from "./orders";
+import { logAuditEvent, syncOrderToPrintJob } from "./orders";
 
 export type RefundScenario =
   | "kiosk_unreachable"
@@ -262,6 +262,8 @@ export async function executeOrderRefund(params: {
       },
     });
 
+    await syncOrderToPrintJob(order.orderId);
+
     return {
       success:          isSuccess || dbStatus === "REFUND_PROCESSING",
       status:           dbStatus,
@@ -353,6 +355,7 @@ export async function syncPendingRefunds(): Promise<{ synced: number; completed:
             })
             .where(eq(orders.orderId, ref.orderId));
         });
+        await syncOrderToPrintJob(ref.orderId);
         completed++;
       } else if (statusRes.refundStatus === "FAILED") {
         await db

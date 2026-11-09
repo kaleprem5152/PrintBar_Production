@@ -3,6 +3,7 @@ import { mkdir, readFile, readdir, stat, unlink, writeFile } from "fs/promises";
 import os from "os";
 import path from "path";
 import JSZip from "jszip";
+import { syncOrderToPrintJob } from "./orders";
 
 // Uploaded documents live only in temporary storage and are removed after a
 // successful print (or when the customer removes them).
@@ -99,6 +100,7 @@ export async function cleanupOrderFiles(orderId: string): Promise<{ success: boo
         .update(orders)
         .set({ filesDeleted: true, filesDeletedAt: new Date(), cleanupStatus: "CLEANED", updatedAt: new Date() })
         .where(eq(orders.orderId, orderId));
+      await syncOrderToPrintJob(orderId);
       return { success: true };
     }
 
@@ -132,6 +134,8 @@ export async function cleanupOrderFiles(orderId: string): Promise<{ success: boo
         updatedAt: new Date(),
       })
       .where(eq(orders.orderId, orderId));
+
+    await syncOrderToPrintJob(orderId);
 
     return { success: true };
   } catch (err) {
