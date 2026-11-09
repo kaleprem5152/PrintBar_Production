@@ -59,7 +59,16 @@ export async function PATCH(req: Request, ctx: Params) {
     updates.pagesPrinted = Math.max(order.pagesPrinted || 0, Math.min(order.pagesToPrint, body.pagesPrinted));
   }
   if (body.cupsJobId) {
-    updates.cupsJobId = String(body.cupsJobId).slice(0, 100);
+    const cupsJobId = String(body.cupsJobId).slice(0, 100);
+    updates.cupsJobId = cupsJobId;
+    await db
+      .update(devicePrintJobs)
+      .set({
+        cupsJobId,
+        cupsStatus: body.status || "printing",
+        pagesAttempted: body.pagesPrinted !== undefined ? body.pagesPrinted : undefined,
+      })
+      .where(and(eq(devicePrintJobs.orderId, orderId), eq(devicePrintJobs.deviceId, auth.deviceId!)));
   }
   if (body.status === "printing" && order.status !== "printing") {
     updates.status = "printing";
@@ -155,30 +164,44 @@ export async function POST(req: Request, ctx: Params) {
       );
     }
 
-    // 4. Require verified completion evidence
-    if (typeof body.pagesPrinted !== "number" || body.pagesPrinted <= 0) {
-      return Response.json(
-        { error: "Explicit verified pagesPrinted counter (>0) is required for completion." },
-        { status: 400 }
-      );
-    }
-
+    // 4. Verify CUPS Job Ownership against recorded print attempt
     if (!body.cupsJobId || typeof body.cupsJobId !== "string") {
       return Response.json(
         { error: "Explicit CUPS job ID evidence is required for completion." },
         { status: 400 }
       );
     }
+    const cupsJobId = String(body.cupsJobId).trim().slice(0, 100);
 
-    if (order.cupsJobId && body.cupsJobId !== order.cupsJobId) {
+    const [recordedAttempt] = await db
+      .select()
+      .from(devicePrintJobs)
+      .where(
+        and(
+          eq(devicePrintJobs.orderId, orderId),
+          eq(devicePrintJobs.deviceId, auth.deviceId!)
+        )
+      )
+      .limit(1);
+
+    const recordedCupsId = recordedAttempt?.cupsJobId || order.cupsJobId;
+    if (!recordedCupsId) {
       return Response.json(
-        { error: `Mismatched CUPS job ID: expected '${order.cupsJobId}', got '${body.cupsJobId}'.` },
+        { error: "No recorded print attempt with an active CUPS job ID was found for this order. Report progress before completing." },
+        { status: 422 }
+      );
+    }
+    if (recordedCupsId !== cupsJobId) {
+      return Response.json(
+        { error: `CUPS job ownership verification failed: expected recorded job ID '${recordedCupsId}', got '${cupsJobId}'. Arbitrary CUPS job IDs are rejected.` },
         { status: 422 }
       );
     }
 
-    // 5. Verify printer belongs to kiosk
-    const reportedPrinter = body.printer || order.fallbackPrinter || order.printerUsed || (order.colorMode === "color" ? "canon_gx6170" : "kyocera_pa3500x");
+    // 5. Verify printer belongs to kiosk PB-K01 and matches recorded attempt
+    const reportedPrinter = String(
+      body.printer || order.fallbackPrinter || order.printerUsed || (order.colorMode === "color" ? "canon_gx6170" : "kyocera_pa3500x")
+    ).toLowerCase();
     const allowedPrinters = ["kyocera_pa3500x", "canon_gx6170", "printbar-kyocera", "printbar-canon"];
     if (!allowedPrinters.includes(reportedPrinter)) {
       return Response.json(
@@ -187,27 +210,83 @@ export async function POST(req: Request, ctx: Params) {
       );
     }
 
-    const pagesPrinted = Math.min(order.pagesToPrint, body.pagesPrinted);
-    const cupsJobId = String(body.cupsJobId).slice(0, 100);
+    const isCanon = reportedPrinter === "canon_gx6170" || reportedPrinter === "printbar-canon" || reportedPrinter.includes("canon");
+    const canonicalPrinter = isCanon ? "canon_gx6170" : "kyocera_pa3500x";
+
+    if (recordedAttempt?.printerName) {
+      const attemptIsCanon = recordedAttempt.printerName.toLowerCase().includes("canon");
+      if (isCanon !== attemptIsCanon) {
+        return Response.json(
+          { error: `Printer mismatch with recorded print attempt: attempt was for '${recordedAttempt.printerName}', completion reported '${reportedPrinter}'.` },
+          { status: 422 }
+        );
+      }
+    }
+
+    // 6. Verified Output & Partial Completion Handling
+    if (typeof body.pagesPrinted !== "number" || body.pagesPrinted <= 0) {
+      return Response.json(
+        { error: "Explicit verified pagesPrinted counter (>0) is required for completion." },
+        { status: 400 }
+      );
+    }
+
+    const verifiedPages = Math.min(order.pagesToPrint, Math.max(0, body.pagesPrinted));
+    const isPartial = verifiedPages < order.pagesToPrint;
+    const pagesPerSheet = order.pagesPerSheet || 1;
+    const sheetsPrinted = Math.ceil(verifiedPages / pagesPerSheet);
+    const sheetsConsumed = Math.min(order.physicalSheets || sheetsPrinted, sheetsPrinted);
+
+    let finalStatus: "completed" | "refund_pending" | "requires_manual_review" = "completed";
+    let refundStatus = order.refundStatus ?? "NOT_REQUIRED";
+    let refundCalc: ReturnType<typeof calculateRefundAmount> | null = null;
+
+    if (isPartial) {
+      refundCalc = calculateRefundAmount(order, sheetsPrinted);
+      if (refundCalc.requiresReview) {
+        finalStatus = "requires_manual_review";
+        refundStatus = "REFUND_REQUIRES_REVIEW";
+      } else if (refundCalc.refundableAmount > 0) {
+        finalStatus = "refund_pending";
+        refundStatus = "REFUND_REQUESTED";
+      } else {
+        finalStatus = "requires_manual_review";
+        refundStatus = "REFUND_REQUIRES_REVIEW";
+      }
+    }
+
     const now = new Date();
 
-    // 6. Atomic Database Transaction: Order state + Device Paper + Admin Printers + Event Log
+    // 7. Atomic Database Transaction: Order state + Device Paper + Admin Printers + Event Log
     await db.transaction(async (tx) => {
       await tx.insert(deviceEvents).values({
         eventId,
         orderId,
         deviceId: auth.deviceId!,
         action: "complete",
-        payload: { pagesPrinted, cupsJobId },
+        payload: {
+          pagesPrinted: verifiedPages,
+          cupsJobId,
+          printer: canonicalPrinter,
+          partial: isPartial,
+          sheetsConsumed,
+        },
       });
 
       await tx
         .update(orders)
         .set({
-          status: "completed",
-          pagesPrinted,
+          status: finalStatus,
+          pagesPrinted: verifiedPages,
+          sheetsPrinted: sheetsConsumed,
           cupsJobId,
-          completedAt: now,
+          printerUsed: canonicalPrinter,
+          completedAt: finalStatus === "completed" ? now : null,
+          failureReason: isPartial
+            ? `Partial output verified: ${verifiedPages}/${order.pagesToPrint} pages printed.`
+            : null,
+          refundableAmount: isPartial ? (refundCalc?.refundableAmount ?? 0) : 0,
+          refundStatus,
           pin: null, // Clear student collection PIN
           updatedAt: now,
         })
@@ -216,9 +295,15 @@ export async function POST(req: Request, ctx: Params) {
       await tx
         .update(devicePrintJobs)
         .set({
-          completedAt: now,
-          pagesConfirmed: pagesPrinted,
-          cupsStatus: "completed",
+          completedAt: finalStatus === "completed" ? now : null,
+          failedAt: isPartial ? now : null,
+          failureReason: isPartial
+            ? `Partial output verified: ${verifiedPages}/${order.pagesToPrint} pages printed.`
+            : null,
+          pagesConfirmed: verifiedPages,
+          sheetsConfirmed: sheetsConsumed,
+          cupsStatus: finalStatus === "completed" ? "completed" : "partial",
+          printerName: canonicalPrinter,
         })
         .where(
           and(
@@ -227,16 +312,13 @@ export async function POST(req: Request, ctx: Params) {
           )
         );
 
-      // Decrement physical paper inventory atomically
-      const printer = order.fallbackPrinter || order.printerUsed || (order.colorMode === "color" ? "canon_gx6170" : "kyocera_pa3500x");
-      const sheetsConsumed = order.physicalSheets || Math.max(1, Math.ceil(pagesPrinted / (order.pagesPerSheet || 1)));
-
+      // Decrement physical paper inventory strictly on the validated actual printer used
       const [dev] = await tx.select().from(devices).where(eq(devices.id, auth.deviceId!));
       if (dev) {
         let newKyocera = dev.kyoceraPaper ?? 250;
         let newCanon   = dev.canonPaper ?? 250;
 
-        if (printer === "canon_gx6170") {
+        if (isCanon) {
           newCanon = Math.max(0, newCanon - sheetsConsumed);
         } else {
           newKyocera = Math.max(0, newKyocera - sheetsConsumed);
@@ -252,18 +334,18 @@ export async function POST(req: Request, ctx: Params) {
           })
           .where(eq(devices.id, auth.deviceId!));
 
-        // Sync admin fleet printers table
+        // Sync admin fleet printers table strictly for the validated printer
         try {
           const allPrns = await tx.select().from(adminPrinters);
           for (const prn of allPrns) {
-            const isCanon = prn.supportsColor || prn.id.toLowerCase().includes("canon");
-            if ((printer === "canon_gx6170" && isCanon) || (printer !== "canon_gx6170" && !isCanon)) {
+            const prnIsCanon = prn.supportsColor || prn.id.toLowerCase().includes("canon");
+            if ((isCanon && prnIsCanon) || (!isCanon && !prnIsCanon)) {
               await tx
                 .update(adminPrinters)
                 .set({
                   paperRemaining: Math.max(0, (prn.paperRemaining ?? 250) - sheetsConsumed),
                   paperSource: "estimated",
-                  totalPages: (prn.totalPages ?? 0) + pagesPrinted,
+                  totalPages: (prn.totalPages ?? 0) + verifiedPages,
                   lastSuccessfulPrintAt: now,
                 })
                 .where(eq(adminPrinters.id, prn.id));
@@ -275,19 +357,43 @@ export async function POST(req: Request, ctx: Params) {
       }
     });
 
-    // 4. Document privacy cleanup (only executed AFTER transaction commit)
+    // 8. Automatic partial refund execution (only executed AFTER transaction commit)
+    if (isPartial && refundCalc && refundCalc.refundableAmount > 0 && !refundCalc.requiresReview) {
+      try {
+        await executeOrderRefund({
+          orderId,
+          amount: refundCalc.refundableAmount,
+          reason: refundCalc.reason,
+          scenario: "hardware_failure_partial_print",
+          initiatedBy: "system_partial_print",
+        });
+      } catch (refundErr) {
+        console.error(`[jobs] Automatic partial refund failed for ${orderId}:`, (refundErr as Error).message);
+      }
+    }
+
+    // 9. Document privacy cleanup (only executed AFTER transaction commit)
     try {
       await cleanupOrderFiles(orderId);
     } catch (cleanErr) {
       console.error(`[jobs] Cloud cleanup failed for ${orderId}:`, (cleanErr as Error).message);
     }
 
-    // 5. Audit Logging & Admin Dashboard Sync
+    // 10. Audit Logging & Admin Dashboard Sync
     await logAuditEvent({
-      eventType: "print_completed",
+      eventType: isPartial ? "print_failed" : "print_completed",
       orderId,
       deviceId: auth.deviceId,
-      details: { pagesPrinted, cupsJobId, eventId },
+      details: {
+        pagesPrinted: verifiedPages,
+        pagesExpected: order.pagesToPrint,
+        cupsJobId,
+        printerUsed: canonicalPrinter,
+        partial: isPartial,
+        refundStatus,
+        refundableAmount: isPartial ? (refundCalc?.refundableAmount ?? 0) : 0,
+        eventId,
+      },
     });
 
     await syncOrderToPrintJob(orderId);
@@ -296,8 +402,14 @@ export async function POST(req: Request, ctx: Params) {
       ok: true,
       acknowledged: true,
       eventId,
-      status: "completed",
-      pagesPrinted,
+      status: finalStatus,
+      partial: isPartial,
+      pagesPrinted: verifiedPages,
+      pagesExpected: order.pagesToPrint,
+      sheetsConsumed,
+      printerUsed: canonicalPrinter,
+      refundStatus,
+      refundableAmount: isPartial ? (refundCalc?.refundableAmount ?? 0) : 0,
     });
   }
 

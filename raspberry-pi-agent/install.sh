@@ -207,31 +207,58 @@ cat > "${AGENT_DIR}/start-kiosk.sh" <<'EOF'
 set -euo pipefail
 
 CONFIG_FILE="/etc/printbar/printbar.env"
-if [[ -f "${CONFIG_FILE}" ]]; then
-    set -a
-    source "${CONFIG_FILE}"
-    set +a
+if [[ ! -f "${CONFIG_FILE}" ]]; then
+    echo "[FAIL] Missing configuration file ${CONFIG_FILE}. Kiosk blocked." >&2
+    exit 1
 fi
 
-KIOSK_URL="${KIOSK_URL:-https://printbarproduction-production.up.railway.app/kiosk}"
+set -a
+source "${CONFIG_FILE}"
+set +a
 
-# Preflight check: verify CUPS queues exist before launching customer-facing display
-if command -v lpstat &>/dev/null; then
-    KYOCERA_STATUS=$(lpstat -p "${KYOCERA_QUEUE:-printbar-kyocera}" 2>&1 || true)
-    CANON_STATUS=$(lpstat -p "${CANON_QUEUE:-printbar-canon}" 2>&1 || true)
-    if echo "${KYOCERA_STATUS}" | grep -qi "unknown destination" && echo "${CANON_STATUS}" | grep -qi "unknown destination"; then
-        echo "[WARN] Printer queues are not yet registered. Run configure-printers.sh before starting kiosk UI." >&2
-    fi
+# 1. Validate device credentials
+SECRET_VAL="${DEVICE_AUTH_SECRET:-}"
+if [[ -z "${SECRET_VAL}" || "${SECRET_VAL}" == *"placeholder"* || ${#SECRET_VAL} -lt 16 ]]; then
+    echo "[FAIL] Missing or invalid DEVICE_AUTH_SECRET in ${CONFIG_FILE}. Kiosk blocked." >&2
+    exit 1
 fi
 
-# Dynamically detect active display or wayland compositor
+# 2. Validate CUPS service & queues
+if ! systemctl is-active --quiet cups 2>/dev/null; then
+    echo "[FAIL] CUPS daemon is not running. Kiosk blocked." >&2
+    exit 1
+fi
+
+if ! command -v lpstat &>/dev/null; then
+    echo "[FAIL] lpstat command missing. CUPS client not installed. Kiosk blocked." >&2
+    exit 1
+fi
+
+KYOCERA_Q="${KYOCERA_QUEUE:-printbar-kyocera}"
+CANON_Q="${CANON_QUEUE:-printbar-canon}"
+
+KYOCERA_STATUS=$(lpstat -p "${KYOCERA_Q}" 2>&1 || true)
+CANON_STATUS=$(lpstat -p "${CANON_Q}" 2>&1 || true)
+
+if echo "${KYOCERA_STATUS}" | grep -qiE "unknown destination|disabled"; then
+    echo "[FAIL] CUPS queue '${KYOCERA_Q}' is missing or disabled. Run configure-printers.sh before starting kiosk." >&2
+    exit 1
+fi
+
+if echo "${CANON_STATUS}" | grep -qiE "unknown destination|disabled"; then
+    echo "[FAIL] CUPS queue '${CANON_Q}' is missing or disabled. Run configure-printers.sh before starting kiosk." >&2
+    exit 1
+fi
+
+# 3. Dynamically detect active graphical display or wayland compositor
 if [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ]]; then
     if [[ -e "/tmp/.X11-unix/X0" ]]; then
         export DISPLAY=:0
     elif [[ -n "$(ls /run/user/$(id -u)/wayland-* 2>/dev/null)" ]]; then
         export WAYLAND_DISPLAY=$(basename $(ls /run/user/$(id -u)/wayland-* | head -n1))
     else
-        export DISPLAY=:0
+        echo "[FAIL] No graphical display session detected for kiosk. Kiosk blocked." >&2
+        exit 1
     fi
 fi
 
@@ -239,11 +266,14 @@ if [[ -f "${HOME}/.Xauthority" && -z "${XAUTHORITY:-}" ]]; then
     export XAUTHORITY="${HOME}/.Xauthority"
 fi
 
+# 4. Validate Chromium browser executable
 CHROMIUM_BIN=$(command -v chromium-browser || command -v chromium || command -v google-chrome || echo "")
 if [[ -z "${CHROMIUM_BIN}" ]]; then
-    echo "[FAIL] Chromium not found. Install chromium-browser to run kiosk display." >&2
+    echo "[FAIL] Chromium executable not found. Install chromium-browser to run kiosk display." >&2
     exit 1
 fi
+
+KIOSK_URL="${KIOSK_URL:-https://printbarproduction-production.up.railway.app/kiosk}"
 
 exec "${CHROMIUM_BIN}" \
     --kiosk \
@@ -317,32 +347,31 @@ WantedBy=graphical.target
 EOF
 
 systemctl daemon-reload
-systemctl enable printbar-agent.service
-systemctl enable printbar-kiosk.service
-
-# Local CUPS configuration (Local only — NO remote administration)
 systemctl enable cups
 systemctl start cups || true
-pass "System services enabled (agent and kiosk browser)"
+systemctl enable printbar-agent.service
+pass "Agent daemon and CUPS service enabled"
 
 # 12. Preflight Installation Verification
 info "Running installer preflight verification..."
 PREFLIGHT_OK=true
 
+# Check 1: Config file & secret credentials
 if [[ -f "${CONFIG_FILE}" ]]; then
     pass "Configuration file exists: ${CONFIG_FILE}"
     SECRET_VAL=$(grep -E "^DEVICE_AUTH_SECRET=" "${CONFIG_FILE}" | cut -d= -f2- || echo "")
-    if [[ -z "${SECRET_VAL}" || "${SECRET_VAL}" == *"placeholder"* ]]; then
-        warn "DEVICE_AUTH_SECRET is empty or placeholder in ${CONFIG_FILE}"
+    if [[ -z "${SECRET_VAL}" || "${SECRET_VAL}" == *"placeholder"* || ${#SECRET_VAL} -lt 16 ]]; then
+        warn "DEVICE_AUTH_SECRET is empty, placeholder, or too short in ${CONFIG_FILE}"
         PREFLIGHT_OK=false
     else
-        pass "DEVICE_AUTH_SECRET is configured"
+        pass "DEVICE_AUTH_SECRET is valid and configured"
     fi
 else
     fail "Configuration file missing: ${CONFIG_FILE}"
     PREFLIGHT_OK=false
 fi
 
+# Check 2: CUPS daemon active
 if systemctl is-active --quiet cups 2>/dev/null; then
     pass "CUPS daemon is running"
 else
@@ -350,15 +379,24 @@ else
     PREFLIGHT_OK=false
 fi
 
-KYOCERA_Q=$(lpstat -p printbar-kyocera 2>&1 || true)
-CANON_Q=$(lpstat -p printbar-canon 2>&1 || true)
-if echo "${KYOCERA_Q}" | grep -q "printbar-kyocera" && echo "${CANON_Q}" | grep -q "printbar-canon"; then
-    pass "CUPS print queues registered (printbar-kyocera, printbar-canon)"
+# Check 3: CUPS queues exist and are enabled
+KYOCERA_STATUS=$(lpstat -p printbar-kyocera 2>&1 || true)
+CANON_STATUS=$(lpstat -p printbar-canon 2>&1 || true)
+if echo "${KYOCERA_STATUS}" | grep -q "printbar-kyocera" && ! echo "${KYOCERA_STATUS}" | grep -qi "disabled"; then
+    pass "CUPS queue printbar-kyocera is registered and enabled"
 else
-    warn "One or more CUPS printer queues not yet registered"
+    warn "CUPS queue printbar-kyocera is missing or disabled"
     PREFLIGHT_OK=false
 fi
 
+if echo "${CANON_STATUS}" | grep -q "printbar-canon" && ! echo "${CANON_STATUS}" | grep -qi "disabled"; then
+    pass "CUPS queue printbar-canon is registered and enabled"
+else
+    warn "CUPS queue printbar-canon is missing or disabled"
+    PREFLIGHT_OK=false
+fi
+
+# Check 4: Chromium browser binary
 if [[ -n "${CHROMIUM_BIN}" ]]; then
     pass "Chromium browser available: ${CHROMIUM_BIN}"
 else
@@ -366,6 +404,17 @@ else
     PREFLIGHT_OK=false
 fi
 
+# Check 5: Display session availability
+HAS_DISPLAY=false
+if [[ -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" || -e "/tmp/.X11-unix/X0" || -n "$(ls /run/user/${UID:-1000}/wayland-* 2>/dev/null || true)" ]]; then
+    HAS_DISPLAY=true
+    pass "Graphical display session available"
+else
+    warn "No graphical display session detected (desktop environment may need restart)"
+    PREFLIGHT_OK=false
+fi
+
+# Check 6: Cloud backend reachability
 CLOUD_TARGET="${CLOUD_API_URL:-https://printbarproduction-production.up.railway.app}"
 if curl -s -m 5 "${CLOUD_TARGET}/api/health" &>/dev/null; then
     pass "Cloud backend reachable: ${CLOUD_TARGET}"
@@ -375,19 +424,29 @@ fi
 
 echo ""
 echo "============================================================"
+# Start agent service unconditionally so telemetry & diagnostics remain available
+systemctl start printbar-agent.service || true
+pass "Agent daemon started (telemetry & remote diagnostics active)"
+
 if [[ "${PREFLIGHT_OK}" == "true" ]]; then
+    systemctl enable printbar-kiosk.service
+    systemctl start printbar-kiosk.service || true
     echo -e "${GREEN}   Installation & Preflight Completed Successfully${NC}"
+    echo "   Kiosk service enabled and started."
     echo "============================================================"
-    echo " Starting background agent service..."
-    systemctl start printbar-agent.service || true
 else
-    echo -e "${YELLOW}   Installation Complete — Configuration Actions Required${NC}"
+    # Block kiosk startup and disable on boot until issues are fixed
+    systemctl disable printbar-kiosk.service 2>/dev/null || true
+    systemctl stop printbar-kiosk.service 2>/dev/null || true
+    echo -e "${YELLOW}   Kiosk Startup Blocked — Preflight Requirements Incomplete${NC}"
+    echo "   Customer-facing display will NOT launch until resolved."
     echo "============================================================"
-    echo " Kiosk display deferred until required hardware is configured."
+    echo " Agent diagnostics and cloud reporting remain fully operational."
 fi
+
 echo " Next steps:"
-echo " 1. Set printer static IPs in ${CONFIG_FILE}"
+echo " 1. Configure printer static IPs in ${CONFIG_FILE}"
 echo " 2. Run 'sudo bash configure-printers.sh' to establish CUPS queues"
 echo " 3. Verify complete diagnostic status with 'sudo bash doctor.sh'"
-echo " 4. Start kiosk display: 'sudo systemctl start printbar-kiosk'"
+echo " 4. Once preflight checks pass, enable kiosk with: 'sudo systemctl enable --now printbar-kiosk'"
 echo ""
