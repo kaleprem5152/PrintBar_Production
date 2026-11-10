@@ -60,61 +60,134 @@ export async function POST(req: Request) {
     return Response.json({ error: "orderId is required." }, { status: 400 });
   }
 
-  // Atomically transition from 'paid' → 'queued' for this specific order
-  // Only one device can claim it (CAS-style update)
-  const [claimed] = await db
-    .update(orders)
-    .set({
-      status:         "queued",
-      deviceId,
-      printClaimedAt: new Date(),
-      updatedAt:      new Date(),
-    })
-    .where(
-      and(
-        eq(orders.orderId, orderId),
-        eq(orders.status, "paid"),        // Only claim from 'paid' state
-      )
-    )
-    .returning();
+  const jobRef = `JOB-${randomBytes(6).toString("hex").toUpperCase()}`;
+  const now = new Date();
 
-  if (!claimed) {
+  let claimResult: {
+    claimed: typeof orders.$inferSelect;
+    attempts: Array<typeof devicePrintJobs.$inferSelect>;
+  } | null = null;
+
+  try {
+    claimResult = await db.transaction(async (tx) => {
+      // Atomically transition from 'paid' → 'queued' for this specific order
+      const [claimed] = await tx
+        .update(orders)
+        .set({
+          status:         "queued",
+          deviceId,
+          printClaimedAt: now,
+          updatedAt:      now,
+        })
+        .where(
+          and(
+            eq(orders.orderId, orderId),
+            eq(orders.status, "paid"),
+          )
+        )
+        .returning();
+
+      if (!claimed) return null;
+
+      const defaultPrinter = claimed.colorMode === "color" ? "canon_gx6170" : "kyocera_pa3500x";
+      const docs = Array.isArray(claimed.docs) && claimed.docs.length > 0 ? claimed.docs : [];
+      const copies = Math.max(1, claimed.copies || 1);
+      const pagesPerSheet = Math.max(1, claimed.pagesPerSheet || 1);
+
+      const attemptRowsToInsert =
+        docs.length > 0
+          ? docs.map((doc, idx) => {
+              const docPages = Math.max(1, Number(doc.selected ?? doc.pages ?? 1)) * copies;
+              return {
+                attemptId:       `ATT-${randomBytes(8).toString("hex").toUpperCase()}`,
+                orderId,
+                attemptNo:       idx + 1,
+                docId:           doc.id || `doc_${idx + 1}`,
+                jobRef,
+                deviceId,
+                printerName:     defaultPrinter,
+                cupsJobId:       null,
+                status:          "queued",
+                isFallback:      false,
+                pagesAttempted:  docPages,
+                sheetsAttempted: Math.max(1, Math.ceil(docPages / pagesPerSheet)),
+              };
+            })
+          : [
+              {
+                attemptId:       `ATT-${randomBytes(8).toString("hex").toUpperCase()}`,
+                orderId,
+                attemptNo:       1,
+                docId:           null,
+                jobRef,
+                deviceId,
+                printerName:     defaultPrinter,
+                cupsJobId:       null,
+                status:          "queued",
+                isFallback:      false,
+                pagesAttempted:  Math.max(1, claimed.pagesToPrint || 1),
+                sheetsAttempted: Math.max(1, claimed.physicalSheets || 1),
+              },
+            ];
+
+      const insertedAttempts = await tx
+        .insert(devicePrintJobs)
+        .values(attemptRowsToInsert)
+        .returning();
+
+      return { claimed, attempts: insertedAttempts };
+    });
+  } catch (dbErr) {
+    console.error(`[jobs] Atomic claim transaction failed for ${orderId}:`, (dbErr as Error).message);
+    return Response.json(
+      { error: "Database unavailable during job claim." },
+      { status: 503 }
+    );
+  }
+
+  if (!claimResult) {
     return Response.json(
       { error: "Order is not available for claiming (already claimed or not found)." },
       { status: 409 }
     );
   }
 
-  // Create a print job record
-  const jobRef = `JOB-${randomBytes(6).toString("hex").toUpperCase()}`;
-  await db.insert(devicePrintJobs).values({
-    orderId,
-    jobRef,
-    deviceId,
-    printerName:    claimed.colorMode === "color" ? "canon_gx6170" : "kyocera_pa3500x",
-    isFallback:     false,
-  });
+  const { claimed, attempts } = claimResult;
 
   await logAuditEvent({
     eventType: "print_started",
     orderId,
     deviceId,
-    details:   { jobRef, printerName: claimed.colorMode === "color" ? "canon_gx6170" : "kyocera_pa3500x" },
+    details: {
+      jobRef,
+      printerName: claimed.colorMode === "color" ? "canon_gx6170" : "kyocera_pa3500x",
+      attempts: attempts.map((a) => ({ attemptId: a.attemptId, attemptNo: a.attemptNo, docId: a.docId })),
+    },
   });
 
   await syncOrderToPrintJob(claimed);
 
   return Response.json({
-    ok:      true,
-    orderId: claimed.orderId,
+    ok:        true,
+    orderId:   claimed.orderId,
     jobRef,
-    docs:    claimed.docs,
+    attemptId: attempts[0]?.attemptId ?? null,
+    attempts:  attempts.map((a) => ({
+      attemptId:      a.attemptId,
+      attemptNo:      a.attemptNo,
+      docId:          a.docId,
+      printerName:    a.printerName,
+      pagesAttempted: a.pagesAttempted,
+      status:         a.status,
+    })),
+    docs:      claimed.docs,
     settings: {
-      colorMode:   claimed.colorMode,
-      copies:      claimed.copies,
-      paperSize:   claimed.paperSize,
-      sides:       claimed.sides,
-      orientation: claimed.orientation,
+      colorMode:     claimed.colorMode,
+      copies:        claimed.copies,
+      paperSize:     claimed.paperSize,
+      sides:         claimed.sides,
+      orientation:   claimed.orientation,
+      pagesPerSheet: claimed.pagesPerSheet,
     },
     pagesToPrint: claimed.pagesToPrint,
   });

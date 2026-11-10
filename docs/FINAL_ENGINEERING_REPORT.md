@@ -5,7 +5,7 @@
 **Printers:** Kyocera ECOSYS PA3500x (Primary B&W) & Canon MAXIFY GX6170 (Colour & Fallback)  
 **Production URL:** `https://printbarproduction-production.up.railway.app`  
 **GitHub Repository:** `https://github.com/kaleprem5152/PrintBar_Production`  
-**Date:** November 2026  
+**Date:** November 10, 2026  
 **Final Status:** `CODE READY — HARDWARE VALIDATION REQUIRED`
 
 ---
@@ -13,106 +13,89 @@
 ## SECTION A — SYSTEM ARCHITECTURE OVERVIEW
 
 The PrintBar system comprises three tightly coupled, hardened layers:
+
 1. **Cloud Backend & Admin Control Centre (Next.js 16 App Router on Railway & Supabase PostgreSQL)**:
    - Complete self-service customer workflow: Document upload, server-side preflight & setting validation, dynamic pricing engine (₹2/B&W sheet, ₹8/Colour sheet), Cashfree payment integration with webhook HMAC verification, collection PIN issuance.
-   - Dedicated Admin Control Centre: Real-time printer health, live telemetry, paper inventory management with +250 refill triggers, remote CUPS maintenance actions, full audit logs.
-   - Authoritative Single Source of Truth: Canonical HMAC authentication for all agent endpoints (`authenticateDevice`), eliminating raw secrets, with durable PostgreSQL server-side nonce replay protection.
+   - Dedicated Admin Control Centre: Real-time printer health, live telemetry, paper inventory management with +250 refill triggers, remote CUPS maintenance actions, full audit logs, and role-based authentication (`super_admin`, `ops_admin`, `finance_admin`, `maintenance`).
+   - Authoritative Single Source of Truth: Canonical HMAC-SHA256 authentication for all agent endpoints (`authenticateDevice`) using `METHOD:PATH:TIMESTAMP:NONCE:BODY_SHA256`, with durable PostgreSQL `device_nonces` replay protection and fail-closed `device_events` idempotency.
+   - **Strict Individual Print-Attempt Identity (`device_print_jobs`)**: Every individual print attempt receives a unique backend-generated `attempt_id`, sequential `attempt_no`, optional `doc_id`, lifecycle `status`, and a PostgreSQL partial unique index `dpj_device_cups_uidx (device_id, cups_job_id) WHERE cups_job_id IS NOT NULL` guaranteeing 1-to-1 CUPS job ownership.
 
-2. **Raspberry Pi Autonomous Hardware Daemon (`agent.py` v3.1)**:
-   - Runs under isolated `printbar` system user in `/opt/printbar/agent` with systemd watchdog.
-   - Durable SQLite database (`agent.db`, schema v4) with Write-Ahead Logging (`WAL`), foreign keys, and durable outbox with exponential backoff (no silent event drops).
-   - Dual-telemetry heartbeats transmitting genuine Pi 5 thermal readings, memory, and CPU metrics alongside physical printer states.
-   - Replay protection with local and server-side nonce validation.
-   - Safe failure recovery: Startup reconciliation checks recorded CUPS IDs and flags uncertain output for manual review instead of blindly failing or completing.
+2. **Raspberry Pi Autonomous Hardware Daemon (`agent.py` v4.0)**:
+   - Runs under isolated `printbar` system user in `/opt/printbar/agent` with systemd supervision (`printbar-agent.service`). Customer display (`printbar-kiosk.service`) is conditionally gated behind hardware/queue/credential/display preflight checks.
+   - Durable SQLite database (`agent.db`, schema v6) with Write-Ahead Logging (`WAL`), foreign keys, unique CUPS job index (`idx_pa_cups_job_id`), unique `attempt_id` index (`idx_pa_attempt_id`), and FIFO durable outbox (`ORDER BY created_at ASC, id ASC`) with jittered exponential backoff.
+   - Retains the exact `attempt_id`, `printer_queue`, and `cups_job_id` through submission, CUPS binding (`?action=bind`), progress (`PATCH`), completion (`?action=complete`), outbox retries, and crash recovery.
+   - Startup crash recovery reconciles persisted `print_attempts` rows against CUPS without minting duplicate attempt identities for already-submitted physical jobs, flagging uncertain output for `MANUAL_REVIEW`.
 
 3. **Print Execution & CUPS Subsystem (`cups_manager.py` & `printer_monitor.py`)**:
-   - Native IPP Everywhere Ethernet connection (`ipp://<IP>:631/ipp/print`). Zero simulation mode.
-   - Capability-validated job submission: Strict monochrome enforcement on Kyocera, N-up validation (1, 2, 4, 6, 9, 16), duplex option handling.
-   - Strict print monitor timeout: Unverified or halted prints are safely flagged for manual review rather than falsely reported as complete.
-   - Reliable customer document cleanup with file overwrite and verified unlinking.
+   - Native IPP Everywhere Ethernet connection (`ipp://<IP>:631/ipp/print`). Zero simulation mode (`sim-*` removed).
+   - Validated IPP binary response parser with boundary checks returning explicit `UNKNOWN` (`source="ipp_parse_error"`) on truncated or malformed frames.
+   - Uncertain CUPS submissions (exit 0 without `request id is`) classify as `UNKNOWN/RECONCILIATION_REQUIRED` and halt for `MANUAL_REVIEW` without auto-reprint.
 
 ---
 
-## SECTION B — DEFECT RESOLUTION SUMMARY
+## SECTION B — DEFECT & BLOCKER RESOLUTION SUMMARY
 
-| Defect | Issue Description | Hardened Resolution |
+| Blocker / Defect | Issue Description | Hardened Resolution |
 | :--- | :--- | :--- |
-| **P0-1** | HMAC format divergence & raw secrets | Unified canonical HMAC signature `METHOD:PATH:TIMESTAMP:NONCE:BODY_SHA256`. Removed `x-agent-key` raw secret. Added durable PostgreSQL `device_nonces` table. |
-| **P0-2** | Simulation fallbacks in CUPS manager | Removed all `sim-*` job IDs and mock readiness. Missing `lp`/`lpstat` binaries return explicit failures. |
-| **P0-3** | Print monitor timeout fallthrough | Added strict terminal completion check. Timed-out jobs raise errors and flag for `MANUAL_REVIEW`. |
-| **P0-4** | Unsafe automatic partial failover | Mid-print hardware halts flag `MANUAL_REVIEW` to prevent missing or duplicate physical pages. |
-| **P0-5** | False outbox sync on HTTP 4xx | Only HTTP 2xx marks outbox synced. Outbox events retry with exponential backoff and are never silently discarded. |
-| **P0-6** | Startup recovery blind failure | Startup crash recovery reconciles CUPS job state against SQLite records; uncertain physical output flags `MANUAL_REVIEW`. |
-| **P1-7** | Dual API family divergence | Consolidated agent authentication across `/api/agent/*` and `/api/device/*` using canonical HMAC auth. |
-| **P1-8** | Command loss on Pi crash | Implemented lease-based command polling with 60s expiration and confirmed backend acknowledgement. |
-| **P1-9** | Multi-document accounting | Multi-document iteration accurately calculates cumulative pages, attempts, copies, and order totals. |
-| **P1-10**| Setting validation (N-up, Colour) | Validates N-up (1,2,4,6,9,16) and blocks colour submission to monochrome Kyocera. |
-| **P1-11**| Missing CUPS queue false readiness | CUPS queue check is mandatory; a missing or disabled queue is never ready even if IPP responds. |
-| **P1-12**| Telemetry sensor fabrication | Sensors report `None` / "unsupported" when hardware does not provide levels; no fabricated values. |
-| **P1-13**| Installer user/display assumptions | Installer auto-detects non-root desktop user; removed `--no-sandbox` and remote CUPS admin; safe queue updates. |
-| **P1-14**| SQLite job claim overwrite | Job claim check preserves existing progress, attempts, and status if job is already in flight. |
-| **P1-15**| Outbox silent abandonment | Added exponential backoff (`next_retry_at`) and telemetry backlog visibility. |
-| **P1-16**| Accurate privacy documentation | Replaced inaccurate claims with genuine secure file cleanup and cleanup error tracking. |
+| **Attempt Identity & CUPS Ownership** | Attempts identified only by `(orderId, deviceId)` with `.limit(1)` and bulk updates overwriting historical `cupsJobId`s | Added `attempt_id` (`dpj_attempt_id_uidx`), `(order_id, attempt_no)` (`dpj_order_attempt_no_uidx`), `doc_id`, `status`, and `(device_id, cups_job_id)` unique index (`dpj_device_cups_uidx`). Added `?action=attempt` and `?action=bind` endpoints; `PATCH` and `?action=complete` resolve strictly by unique `attemptId`, validate `(orderId, deviceId, printer, cupsJobId, status)`, and reject late/mismatched/duplicate events. |
+| **Inventory Isolation & Partial Completion** | Fallback or queue aliases could deduct wrong tray; partial output could mark order `completed` | Normalized printer names (`kyocera_pa3500x` vs `canon_gx6170`) enforced across attempts, device tray deductions, and fleet stats. Partial attempts route to `partial` / `refund_pending` / `requires_manual_review` and only complete full multi-doc orders once verified pages reach `pagesToPrint`. |
+| **Fail-Closed Event Idempotency** | Swallowed `device_events` exceptions could risk duplicate deductions | Database lookup/insert failures reject with HTTP 503 so the agent outbox retries safely. |
+| **IPP Parsing & Uncertain CUPS** | Truncated IPP frames or unparseable `lp` outputs risked false readiness or success | Fixed `val_len` offset & boundary validation in `printer_monitor.py`; `cups_manager.py` yields `UNKNOWN/RECONCILIATION_REQUIRED` halting for `MANUAL_REVIEW`. |
+| **Conditional Kiosk Startup** | Unconditional `printbar-kiosk.service` enabling could launch unconfigured kiosk UI on reboot | `install.sh` and `start-kiosk.sh` gate kiosk enable/start on config, secret, CUPS daemon, active queues, Chromium, and graphical display; failures disable `printbar-kiosk.service` while keeping `printbar-agent.service` active for diagnostics. |
 
 ---
 
-## SECTION C — VERIFIED TEST RESULTS
+## SECTION C — VERIFIED AUTOMATED SOFTWARE RESULTS
 
-### 1. Python Agent Test Suite (Pytest)
-```
-tests/test_agent.py (5/5 PASSED)
-tests/test_auth.py (5/5 PASSED - Shared Python/TypeScript vector matches)
-tests/test_config.py (6/6 PASSED)
-tests/test_cups_manager.py (6/6 PASSED)
-tests/test_db.py (5/5 PASSED)
-tests/test_printer_monitor.py (5/5 PASSED)
-tests/test_production_defects.py (13/13 PASSED - Outbox ack, command recovery, error branches)
+> **Important Distinction:** All checks below were executed on **software, simulated PostgreSQL (`pg-mem`), mocked CUPS/IPP fixtures, and live cloud schema verification** on the Windows development environment. Physical Raspberry Pi 5, physical Kyocera PA3500x, and physical Canon GX6170 hardware validation has **not** yet been executed.
 
-Total: 45 Passed | 0 Failed (100% PASS)
-```
+### 1. Python Agent Test Suite (`pytest`)
+Command: `python -m pytest tests/ -v` (in `raspberry-pi-agent`, verified on Python 3.14.6)
+```text
+tests/test_agent.py                 (5 / 5 PASSED)
+tests/test_auth.py                  (5 / 5 PASSED — Shared Python/TypeScript HMAC vector verified)
+tests/test_config.py                (6 / 6 PASSED)
+tests/test_cups_manager.py          (7 / 7 PASSED — includes unparseable lp output check)
+tests/test_db.py                    (5 / 5 PASSED)
+tests/test_printer_monitor.py       (9 / 9 PASSED — includes valid/truncated/malformed IPP tests)
+tests/test_production_defects.py    (16 / 16 PASSED — multi-doc attempt isolation, preflight Canon fallback, SQLite unique CUPS index, crash recovery, outbox, command leases)
 
-### 2. Backend & Next.js Unit / Integration Tests (Node Test Runner)
-```
-✔ Auth: Password hashing creates valid scrypt dollar format
-✔ Auth: Legacy colon salt:hash format verification
-✔ Device Auth: Exact shared Python/TypeScript test vector matches (100% identical HMAC)
-✔ Device Auth: Valid Canonical HMAC signature with body hash passes
-✔ Device Auth: Body tampering invalidates HMAC signature
-✔ Device Auth: Expired timestamp (>120s) is rejected
-✔ Device Auth: Tampered signature is rejected
-✔ Job Completion: Valid completion request succeeds and acknowledges exact eventId
-✔ Job Completion: Missing eventId is rejected with 400
-✔ Job Completion: Missing pagesPrinted counter is rejected with 400
-✔ Job Completion: Mismatched CUPS job ID is rejected with 422
-✔ Job Completion: Invalid state transition is rejected with 409
-✔ Job Completion: Idempotent re-submission on already completed order succeeds without error
-✔ Job Completion: Printer not belonging to kiosk PB-K01 is rejected with 400
-✔ Failover: Mid-print failure at page 4 of 10 routes pages 5-10 to backup Canon
-✔ Failover: Failure on initial page 0 routes entire document 1-15
-✔ Failover: Failure on penultimate page routes only single remaining page
-✔ Failover: Already completed job requires no failover
-✔ Pricing: Single-sided B&W calculation at SGU standard rate (₹2)
-✔ Pricing: Double-sided (duplex) B&W calculation
-✔ Pricing: Colour single-sided calculation at SGU standard rate (₹8)
-✔ Pricing: Colour double-sided with multi-copies
-✔ Refunds: Total print failure receives 100% full refund
-✔ Refunds: Full completion results in zero refund
-✔ Refunds: Partial failure at 10 of 20 sheets refunds exactly unprinted balance
-
-Total: 25 Passed | 0 Failed (100% PASS)
+Total: 53 Passed | 0 Failed | 0 Skipped (1.71s)
 ```
 
-### 3. Static Type Analysis & Production Compilation
-- **TypeScript:** `npx tsc --noEmit` -> **0 Errors**
-- **Next.js Production Build:** `npm run build` -> **Exit code 0**, all 48+ static & dynamic routes compiled
-- **Python Compilation:** `python -m py_compile` -> **All 7 agent modules compile with 0 errors**
-- **Shell Script Syntax:** `bash -n` on `install.sh`, `configure-printers.sh`, `doctor.sh` -> **0 Errors**
-- **Database Schema Migrations:** PostgreSQL Drizzle + SQLite `db.init_db()` -> **Verified Clean**
+### 2. Backend & Database Regression Suite (`node --test`)
+Command: `npm test` (`node --test tests/*.test.js`)
+```text
+tests/auth.test.js                  (4 / 4 PASSED — scrypt hashing, legacy format, role aliases, password trimming)
+tests/device_auth.test.js           (5 / 5 PASSED — canonical HMAC vectors, replay & skew checks)
+tests/device_job_completion.test.js (14 / 14 PASSED — ownership, printer inventory isolation, partial completion refunds, fail-closed 503)
+tests/failover.test.js              (4 / 4 PASSED)
+tests/pricing.test.js               (4 / 4 PASSED)
+tests/print_attempt_identity.test.js(7 test blocks covering all 12 regression scenarios against pg-mem PostgreSQL with unique constraints — 7 / 7 PASSED)
+tests/refunds.test.js               (3 / 3 PASSED)
+
+Total: 41 Passed | 0 Failed | 0 Skipped (10.33s)
+```
+
+### 3. Static Analysis, Schema Validation & Production Build
+- **TypeScript Typecheck:** `npx tsc --noEmit` -> **Exit Code 0 (0 Errors)**
+- **Pyright (Raspberry Pi Agent):** `npx pyright .` -> **0 Errors, 0 Warnings, 0 Informations**
+- **ESLint:** `npx eslint . --quiet` -> **Exit Code 0 (0 Errors)** *(Note: experimental React 19 compiler hook rules configured to `warn` in `eslint.config.mjs` for legacy client components)*
+- **Python Bytecode Compilation:** `python -m py_compile *.py` -> **0 Errors across all agent modules**
+- **Shell Script Syntax:** `bash -n install.sh configure-printers.sh doctor.sh` -> **0 Errors**
+- **Drizzle Schema & Migration Verification:** Applied [`drizzle/0001_print_attempt_identity.sql`](file:///d:/Printbar-production/printbar-product-design-project/drizzle/0001_print_attempt_identity.sql) to Supabase PostgreSQL; `npx drizzle-kit check` -> **Exit Code 0**
+- **Next.js Production Build:** `npm run build` (Next.js 16.2.6 Turbopack) -> **Compiled cleanly in 17.8s, TypeScript finished in 16.9s, Exit Code 0**
 
 ---
 
-## SECTION D — ON-SITE COMMISSIONING CHECKLIST
+## SECTION D — REMAINING SOFTWARE LIMITATIONS & HARDWARE COMMISSIONING
 
+### Remaining Software / Environment Limitations
+1. Physical printer hardware interactions (`lp`, `lpstat`, TCP port 9100, IPP 631 queries, Linux `/sys/class/thermal`, `systemd` unit activation) are verified only via unit mocks and syntax checks on Windows; live execution on Debian/Raspberry Pi OS 64-bit is unverified until commissioning.
+2. Live backend HTTP route integration tests in `tests/*.test.js` exercise the PostgreSQL DDL and transaction logic in `pg-mem` rather than booting an external Next.js server against Supabase during CI.
+3. Mid-document physical failure inside multi-doc orders still intentionally escalates to `MANUAL_REVIEW` / `refund_pending` rather than attempting partial page-offset resumption.
+
+### On-Site Physical Hardware Commissioning Checklist
 To be executed on-site at Sanjay Ghodawat University Food Court:
 1. Connect Raspberry Pi 5 and both printers to the local Ethernet switch.
 2. Reserve static IPs on the local router:
@@ -121,11 +104,10 @@ To be executed on-site at Sanjay Ghodawat University Food Court:
 3. Execute automated installation: `sudo bash install.sh`.
 4. Configure printer queues: `sudo bash configure-printers.sh`.
 5. Execute full system validation: `sudo bash doctor.sh`.
-6. Load 250 sheets of A4 paper into each printer tray and execute the test print command via the Admin Dashboard.
+6. Confirm `systemctl is-enabled printbar-kiosk.service` only passes after preflight checks turn green, then load 250 sheets of A4 paper into each printer tray and execute live test prints and Cashfree test transactions via the Admin Dashboard.
 
 ---
 
 ## SECTION E — FINAL VERDICT
 
-> **CODE READY — HARDWARE VALIDATION REQUIRED**  
-> All software implementations, automated installers, security authentications, failure recovery pipelines, database schemas, and unit test suites are fully completed, tested, and validated in code. Final commissioning requires running `doctor.sh` and executing physical test prints on the live hardware at SGU Food Court.
+> **CODE READY — HARDWARE VALIDATION REQUIRED**

@@ -25,7 +25,7 @@ from config import SQLITE_DB_PATH, DEVICE_ID
 
 logger = logging.getLogger("printbar.db")
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 def get_connection() -> sqlite3.Connection:
@@ -185,6 +185,20 @@ def init_db() -> None:
                 pass
             _set_schema_version(conn, 5)
 
+        if current < 6:
+            logger.info("Applying schema migration v6: attempt_id, doc_id, and unique CUPS job ownership")
+            for stmt in (
+                "ALTER TABLE print_attempts ADD COLUMN attempt_id TEXT",
+                "ALTER TABLE print_attempts ADD COLUMN doc_id TEXT",
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_pa_attempt_id ON print_attempts(attempt_id) WHERE attempt_id IS NOT NULL",
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_pa_cups_job_id ON print_attempts(cups_job_id) WHERE cups_job_id IS NOT NULL",
+            ):
+                try:
+                    conn.execute(stmt)
+                except Exception:
+                    pass
+            _set_schema_version(conn, 6)
+
         conn.commit()
     logger.info("Database initialized at schema version %d", SCHEMA_VERSION)
 
@@ -329,14 +343,41 @@ def record_print_attempt(
     attempt_no: int,
     printer_queue: str,
     cups_job_id: Optional[str] = None,
+    attempt_id: Optional[str] = None,
+    doc_id: Optional[str] = None,
 ) -> int:
+    att_uid = attempt_id or f"ATT-LOC-{uuid.uuid4().hex[:12].upper()}"
     with get_connection() as conn:
+        existing = conn.execute(
+            "SELECT id FROM print_attempts WHERE attempt_id = ?",
+            (att_uid,),
+        ).fetchone()
+        if existing:
+            return int(existing["id"])
         cur = conn.execute("""
-            INSERT INTO print_attempts (order_id, attempt_no, printer_queue, cups_job_id, cups_state)
-            VALUES (?, ?, ?, ?, 'pending')
-        """, (order_id, attempt_no, printer_queue, cups_job_id))
+            INSERT INTO print_attempts (attempt_id, order_id, attempt_no, doc_id, printer_queue, cups_job_id, cups_state)
+            VALUES (?, ?, ?, ?, ?, ?, 'pending')
+        """, (att_uid, order_id, attempt_no, doc_id, printer_queue, cups_job_id))
         conn.commit()
         return cur.lastrowid or 0
+
+
+def get_attempts_for_order(order_id: str) -> List[Dict[str, Any]]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM print_attempts WHERE order_id = ? ORDER BY attempt_no ASC, id ASC",
+            (order_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_attempt_by_id(attempt_id: str) -> Optional[Dict[str, Any]]:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM print_attempts WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()
+        return dict(row) if row else None
 
 
 def update_print_attempt(
@@ -422,14 +463,14 @@ def get_pending_outbox(limit: int = 10, due_only: bool = False) -> List[Dict[str
                 SELECT * FROM outbox_events
                 WHERE synced = 0
                   AND (next_retry_at IS NULL OR next_retry_at <= CURRENT_TIMESTAMP)
-                ORDER BY created_at ASC
+                ORDER BY created_at ASC, id ASC
                 LIMIT ?
             """, (limit,)).fetchall()
         else:
             rows = conn.execute("""
                 SELECT * FROM outbox_events
                 WHERE synced = 0
-                ORDER BY created_at ASC
+                ORDER BY created_at ASC, id ASC
                 LIMIT ?
             """, (limit,)).fetchall()
         return [dict(r) for r in rows]

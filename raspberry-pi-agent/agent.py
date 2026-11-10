@@ -53,6 +53,7 @@ from db import (
     get_incomplete_jobs,
     record_print_attempt,
     update_print_attempt,
+    get_attempts_for_order,
     save_outbox_event,
     get_pending_outbox,
     mark_outbox_synced,
@@ -130,9 +131,9 @@ class PrintBarAgent:
 
     def _recover_incomplete_jobs(self) -> None:
         """
-        Reconcile incomplete jobs with CUPS job IDs and cloud state.
-        Never blindly fail or complete when physical state is uncertain.
-        Flag uncertain jobs for MANUAL_REVIEW.
+        Reconcile incomplete jobs using persisted individual print attempts (retaining
+        exact attempt_id, printer_queue, and cups_job_id — never minting a new attempt ID
+        for an already-submitted physical job). Flag uncertain jobs for MANUAL_REVIEW.
         """
         jobs = get_incomplete_jobs()
         if not jobs:
@@ -142,42 +143,109 @@ class PrintBarAgent:
 
         for job in jobs:
             order_id = job["order_id"]
-            cups_id = job.get("cups_job_id")
             pages_to_print = job.get("pages_to_print", 0)
+            attempts = get_attempts_for_order(order_id)
+            open_submitted = [a for a in attempts if a.get("cups_job_id") and not a.get("result")]
 
-            logger.info("Reconciling job %s (cups_id: %s, recorded pages: %d)", order_id, cups_id, job.get("pages_printed", 0))
+            logger.info(
+                "Reconciling job %s (open attempts: %d, legacy cups_id: %s, recorded pages: %d)",
+                order_id,
+                len(open_submitted),
+                job.get("cups_job_id"),
+                job.get("pages_printed", 0),
+            )
 
-            if cups_id:
-                prog = self.cups.get_job_progress(cups_id)
-                cups_state = prog.get("state")
-                impr = prog.get("impressions_completed", 0)
-                sheets = prog.get("sheets_completed", 0)
+            if open_submitted:
+                all_acked = True
+                for att in open_submitted:
+                    att_pk = att["id"]
+                    att_uid = att.get("attempt_id")
+                    cups_id = att["cups_job_id"]
+                    printer_q = att.get("printer_queue") or job.get("printer_name") or KYOCERA_QUEUE
 
-                if cups_state == "completed" and prog.get("verified"):
-                    logger.info("Job %s was confirmed completed by CUPS (%d sheets).", order_id, sheets)
-                    ack = self._report_complete(order_id, pages_to_print, cups_id)
-                    if ack:
-                        mark_job_completed(order_id)
-                    continue
+                    prog = self.cups.get_job_progress(cups_id)
+                    cups_state = prog.get("state")
+                    impr = prog.get("impressions_completed", 0)
+                    sheets = prog.get("sheets_completed", 0)
 
-                elif cups_state in ("stopped", "canceled", "aborted"):
-                    logger.warning("Job %s was %s in CUPS at impression %d.", order_id, cups_state, impr)
-                    mark_job_manual_review(
-                        order_id,
-                        f"CUPS reported state '{cups_state}' before restart. Output unverified: {sheets} sheets."
-                    )
-                    self._report_failure(
-                        order_id,
-                        pages_printed=impr,
-                        reason=f"CUPS stopped before agent restart ({cups_state}). Requires manual review.",
-                    )
-                    continue
+                    if cups_state == "completed" and prog.get("verified"):
+                        att_pages = max(att.get("pages_printed") or 0, sheets) if sheets > 0 else (att.get("pages_printed") or pages_to_print)
+                        logger.info(
+                            "Attempt %s (CUPS %s) confirmed completed by CUPS (%d sheets).",
+                            att_uid,
+                            cups_id,
+                            sheets,
+                        )
+                        update_print_attempt(
+                            att_pk,
+                            cups_state="completed",
+                            result="completed",
+                            pages_printed=att_pages,
+                            sheets_printed=sheets,
+                            ended=True,
+                        )
+                        ack = self._report_complete(
+                            order_id,
+                            att_pages,
+                            cups_id,
+                            attempt_id=att_uid,
+                            printer=printer_q,
+                        )
+                        if not ack:
+                            all_acked = False
+                    elif cups_state in ("stopped", "canceled", "aborted"):
+                        logger.warning("Attempt %s (CUPS %s) was %s at impression %d.", att_uid, cups_id, cups_state, impr)
+                        update_print_attempt(
+                            att_pk,
+                            cups_state=cups_state,
+                            result="manual_review",
+                            error_msg=f"CUPS stopped before restart ({cups_state})",
+                            pages_printed=impr,
+                            ended=True,
+                        )
+                        mark_job_manual_review(
+                            order_id,
+                            f"CUPS reported state '{cups_state}' before restart. Output unverified: {sheets} sheets.",
+                        )
+                        self._report_failure(
+                            order_id,
+                            pages_printed=impr,
+                            reason=f"CUPS stopped before agent restart ({cups_state}). Requires manual review.",
+                            attempt_id=att_uid,
+                        )
+                        all_acked = False
+                        break
+                    else:
+                        logger.warning("Attempt %s (CUPS %s) output uncertain after restart. Flagging MANUAL_REVIEW.", att_uid, cups_id)
+                        update_print_attempt(
+                            att_pk,
+                            cups_state=str(cups_state or "unknown"),
+                            result="manual_review",
+                            error_msg="Agent restarted during execution; physical delivery uncertain",
+                            ended=True,
+                        )
+                        mark_job_manual_review(
+                            order_id,
+                            f"Agent restarted during execution. Physical delivery unverified. Last sheets: {sheets}",
+                        )
+                        self._report_failure(
+                            order_id,
+                            pages_printed=job.get("pages_printed", 0),
+                            reason="Agent restarted during execution. Physical delivery uncertain. Flagged for manual review.",
+                            attempt_id=att_uid,
+                        )
+                        all_acked = False
+                        break
 
-            # Uncertain output: Agent crashed/restarted while printing
+                if all_acked and not any(a.get("result") in ("failed", "manual_review") for a in attempts):
+                    mark_job_completed(order_id)
+                continue
+
+            # No open CUPS submission found — uncertain startup crash
             logger.warning("Job %s physical output is uncertain. Flagging for MANUAL_REVIEW.", order_id)
             mark_job_manual_review(
                 order_id,
-                f"Agent restarted during execution. Physical delivery unverified. Last sheets: {job.get('physical_sheets', 0)}"
+                f"Agent restarted during execution. Physical delivery unverified. Last sheets: {job.get('physical_sheets', 0)}",
             )
             self._report_failure(
                 order_id,
@@ -216,15 +284,18 @@ class PrintBarAgent:
 
         # CPU & Memory
         try:
-            import psutil
+            import psutil  # type: ignore[import-untyped]
             t["cpuPct"] = round(psutil.cpu_percent(interval=None))
             t["memPct"] = round(psutil.virtual_memory().percent)
-            if t["tempC"] is None and hasattr(psutil, "sensors_temperatures"):
-                temps = psutil.sensors_temperatures()
-                for key in ("cpu_thermal", "coretemp", "cpu-thermal"):
-                    if key in temps and temps[key]:
-                        t["tempC"] = round(temps[key][0].current, 1)
-                        break
+            sensors_fn = getattr(psutil, "sensors_temperatures", None)
+            if t["tempC"] is None and callable(sensors_fn):
+                temps = sensors_fn()
+                if isinstance(temps, dict):
+                    for key in ("cpu_thermal", "coretemp", "cpu-thermal"):
+                        entries = temps.get(key)
+                        if entries:
+                            t["tempC"] = round(entries[0].current, 1)
+                            break
         except ImportError:
             try:
                 if os.path.exists("/proc/loadavg"):
@@ -598,6 +669,9 @@ class PrintBarAgent:
             settings = claim["settings"]
             docs = claim["docs"]
             pages_to_print = claim["pagesToPrint"]
+            claim_attempts = claim.get("attempts") or []
+            if not claim_attempts and claim.get("attemptId"):
+                claim_attempts = [{"attemptId": claim["attemptId"], "attemptNo": 1, "docId": None}]
             color_mode = settings.get("colorMode", "bw")
             copies = int(settings.get("copies", 1))
             sides = settings.get("sides", "single")
@@ -605,12 +679,13 @@ class PrintBarAgent:
 
             primary_queue = CANON_QUEUE if color_mode == "color" else KYOCERA_QUEUE
             logger.info(
-                "Claimed job %s (%s) -> queue: %s, total pages: %d, docs: %d",
+                "Claimed job %s (%s) -> queue: %s, total pages: %d, docs: %d, attempts: %d",
                 order_id,
                 job_ref,
                 primary_queue,
                 pages_to_print,
                 len(docs),
+                len(claim_attempts),
             )
 
             record_job_claimed(
@@ -626,10 +701,23 @@ class PrintBarAgent:
                 pages_per_sheet=pages_per_sheet,
             )
 
-            self._execute_print_pipeline(order_id, job_ref, primary_queue, docs, settings, pages_to_print)
+            self._execute_print_pipeline(
+                order_id,
+                job_ref,
+                primary_queue,
+                docs,
+                settings,
+                pages_to_print,
+                claim_attempts=claim_attempts,
+            )
 
         except Exception as exc:
             logger.error("Error claiming job %s: %s", order_id, exc)
+
+    @staticmethod
+    def _canonical_printer(queue_or_name: Optional[str]) -> str:
+        val = (queue_or_name or "").lower()
+        return "canon_gx6170" if ("canon" in val or queue_or_name == CANON_QUEUE) else "kyocera_pa3500x"
 
     # ------------------------------------------------------------------
     # Print Pipeline Execution
@@ -643,19 +731,22 @@ class PrintBarAgent:
         docs: List[Dict[str, Any]],
         settings: Dict[str, Any],
         pages_to_print: int,
+        claim_attempts: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """
-        Executes print pipeline with verified multi-doc tracking, capability validation,
-        strict timeout enforcement (no false completions), and safe error handling.
+        Executes print pipeline with per-attempt backend identity, 1-to-1 CUPS job binding,
+        verified multi-doc tracking, capability validation, and strict timeout enforcement.
         """
         job_dir = DOCUMENT_STORAGE_DIR / uuid.uuid4().hex
         job_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
 
-        downloaded_files: List[Tuple[str, int]] = []
+        downloaded_files: List[Tuple[str, str, int]] = []
         total_pages_printed = 0
         cups_job_id: Optional[str] = None
         attempt_id: Optional[int] = None
+        current_attempt_uid: Optional[str] = None
         attempt_no = 0
+        preflight_rerouted = False
 
         color_mode = settings.get("colorMode", "bw")
         copies = int(settings.get("copies", 1))
@@ -682,6 +773,7 @@ class PrintBarAgent:
                             reason,
                         )
                         primary_queue = CANON_QUEUE
+                        preflight_rerouted = True
                     else:
                         raise RuntimeError(f"Kyocera not ready ({reason}) and Canon backup also not ready ({fb_reason}).")
                 else:
@@ -708,17 +800,61 @@ class PrintBarAgent:
                     for chunk in dl_res.iter_content(chunk_size=65536):
                         fh.write(chunk)
                 os.chmod(file_path, 0o600)
-                downloaded_files.append((file_path, doc_pages))
+                downloaded_files.append((doc_id, file_path, doc_pages))
 
             # 3. Notify cloud: Processing
-            self._report_progress(order_id, 0, status="processing")
+            self._report_processing(order_id)
 
-            # 4. Print each document
-            for file_path, doc_pages in downloaded_files:
-                attempt_no += 1
-                attempt_id = record_print_attempt(order_id, attempt_no, primary_queue)
+            canonical_printer = self._canonical_printer(primary_queue)
+            attempts_pool = list(claim_attempts or [])
+            all_acked = True
 
+            # 4. Print each document with its own unique attempt & CUPS job ID
+            for idx, (doc_id, file_path, doc_pages) in enumerate(downloaded_files):
                 expected_doc_pages = doc_pages * copies
+                attempt_no += 1
+
+                # Match initial backend attempt if it matches doc & printer
+                matched = None
+                for cand in attempts_pool:
+                    cand_doc = cand.get("docId")
+                    if cand_doc == doc_id or (cand_doc is None and idx == 0):
+                        matched = cand
+                        break
+                if matched is None and idx < len(attempts_pool):
+                    matched = attempts_pool[idx]
+
+                attempt_uid: Optional[str] = None
+                if matched and (matched.get("printerName") in (None, canonical_printer)) and not preflight_rerouted:
+                    attempt_uid = matched.get("attemptId")
+                    attempt_no = int(matched.get("attemptNo") or attempt_no)
+                else:
+                    # Create a new authentic backend attempt for preflight reroute or additional attempt
+                    supersede_id = matched.get("attemptId") if (matched and preflight_rerouted) else None
+                    created = self._create_backend_attempt(
+                        order_id=order_id,
+                        printer=canonical_printer,
+                        doc_id=doc_id,
+                        is_fallback=preflight_rerouted,
+                        pages_attempted=expected_doc_pages,
+                        supersede_attempt_id=supersede_id,
+                        reason=f"Pre-flight fallback from {KYOCERA_QUEUE} to {CANON_QUEUE}" if preflight_rerouted else None,
+                    )
+                    if created:
+                        attempt_uid = created.get("attemptId")
+                        attempt_no = int(created.get("attemptNo") or attempt_no)
+
+                if not attempt_uid:
+                    attempt_uid = f"ATT-LOC-{uuid.uuid4().hex[:12].upper()}"
+
+                current_attempt_uid = attempt_uid
+                attempt_id = record_print_attempt(
+                    order_id,
+                    attempt_no,
+                    primary_queue,
+                    attempt_id=attempt_uid,
+                    doc_id=doc_id,
+                )
 
                 success, cups_job_id, err = self.cups.print_file(
                     file_path=file_path,
@@ -731,13 +867,19 @@ class PrintBarAgent:
                     number_up=number_up,
                 )
 
-                if not success:
+                if not success or not cups_job_id:
                     if attempt_id:
                         update_print_attempt(attempt_id, result="failed", error_msg=err, ended=True)
                     if cups_job_id == "UNKNOWN/RECONCILIATION_REQUIRED":
                         logger.critical("Uncertain print submission for %s. Halting for MANUAL_REVIEW.", order_id)
                         mark_job_manual_review(order_id, f"Uncertain submission on {primary_queue}: {err}")
-                        self._report_failure(order_id, total_pages_printed, f"MANUAL_REVIEW: {err}")
+                        self._report_failure(
+                            order_id,
+                            total_pages_printed,
+                            f"MANUAL_REVIEW: {err}",
+                            attempt_id=attempt_uid,
+                            manual_review=True,
+                        )
                         return
                     raise RuntimeError(f"CUPS print submission failed on '{primary_queue}': {err}")
 
@@ -745,7 +887,17 @@ class PrintBarAgent:
                     update_print_attempt(attempt_id, cups_job_id=cups_job_id, cups_state="pending")
 
                 update_job_progress(order_id, total_pages_printed, cups_job_id=cups_job_id, status="printing")
-                self._report_progress(order_id, total_pages_printed, cups_job_id=cups_job_id, status="printing")
+
+                # Persist (attemptId, cupsJobId) binding on backend BEFORE progress or completion
+                self._bind_attempt(order_id, attempt_uid, canonical_printer, cups_job_id)
+                self._report_progress(
+                    order_id,
+                    0,
+                    cups_job_id=cups_job_id,
+                    status="printing",
+                    attempt_id=attempt_uid,
+                    printer=canonical_printer,
+                )
 
                 # 5. Monitor authentic CUPS progress with strict timeout
                 doc_impr_completed = 0
@@ -769,28 +921,45 @@ class PrintBarAgent:
                             cups_job_id=cups_job_id,
                             physical_sheets=phys,
                         )
-                        self._report_progress(order_id, total_pages_printed, cups_job_id=cups_job_id)
                         if attempt_id:
                             update_print_attempt(
                                 attempt_id,
                                 cups_state=state,
-                                pages_printed=total_pages_printed,
+                                pages_printed=doc_impr_completed,
                                 sheets_printed=phys,
                             )
+                        self._report_progress(
+                            order_id,
+                            doc_impr_completed,
+                            cups_job_id=cups_job_id,
+                            status="printing",
+                            attempt_id=attempt_uid,
+                            printer=canonical_printer,
+                        )
 
                     if state == "completed":
                         terminal_completed = True
-                        logger.info("CUPS job %s confirmed completed successfully.", cups_job_id)
+                        logger.info("CUPS job %s confirmed completed successfully (attempt %s).", cups_job_id, attempt_uid)
                         total_pages_printed = min(pages_to_print, total_pages_printed + (expected_doc_pages - doc_impr_completed))
                         if attempt_id:
                             update_print_attempt(
                                 attempt_id,
                                 cups_state="completed",
                                 result="completed",
-                                pages_printed=total_pages_printed,
+                                pages_printed=expected_doc_pages,
                                 sheets_printed=phys,
                                 ended=True,
                             )
+                        # Report completion specifically for THIS attempt & CUPS job ID
+                        ack = self._report_complete(
+                            order_id,
+                            expected_doc_pages,
+                            cups_job_id,
+                            attempt_id=attempt_uid,
+                            printer=canonical_printer,
+                        )
+                        if not ack:
+                            all_acked = False
                         break
 
                     elif state in ("stopped", "canceled", "aborted"):
@@ -801,7 +970,7 @@ class PrintBarAgent:
                                 cups_state=state,
                                 result="failed",
                                 error_msg=f"CUPS state: {state}",
-                                pages_printed=total_pages_printed,
+                                pages_printed=doc_impr_completed,
                                 ended=True,
                             )
                         raise RuntimeError(
@@ -817,9 +986,8 @@ class PrintBarAgent:
                         f"Terminal completion was not verified by hardware. Flagging for manual review."
                     )
 
-            # 6. Report completion to cloud
-            ack_success = self._report_complete(order_id, pages_to_print, cups_job_id)
-            if ack_success:
+            # 6. Mark order locally completed after all attempts finished
+            if all_acked:
                 mark_job_completed(order_id)
                 logger.info("Job %s fully completed and acknowledged by cloud.", order_id)
             else:
@@ -831,11 +999,17 @@ class PrintBarAgent:
                 update_print_attempt(attempt_id, result="failed", error_msg=str(exc), ended=True)
 
             mark_job_manual_review(order_id, str(exc))
-            self._report_failure(order_id, total_pages_printed, str(exc))
+            self._report_failure(
+                order_id,
+                total_pages_printed,
+                str(exc),
+                attempt_id=current_attempt_uid,
+                manual_review=True,
+            )
 
         finally:
             # 7. Document Cleanup & Privacy
-            for fp, _ in downloaded_files:
+            for _, fp, _ in downloaded_files:
                 self._secure_delete_file(fp)
 
             try:
@@ -902,20 +1076,118 @@ class PrintBarAgent:
             schedule_outbox_retry(row_id, str(exc))
             return False
 
-    def _report_progress(self, order_id: str, pages_printed: int, cups_job_id: Optional[str] = None, status: Optional[str] = None) -> bool:
+    def _create_backend_attempt(
+        self,
+        order_id: str,
+        printer: str,
+        doc_id: Optional[str] = None,
+        is_fallback: bool = False,
+        pages_attempted: Optional[int] = None,
+        supersede_attempt_id: Optional[str] = None,
+        reason: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Create a new unique print attempt on the backend (for retries, fallbacks, or reroutes)."""
+        path = f"/api/device/jobs/{order_id}?action=attempt"
+        url = f"{CLOUD_API_URL}{path}"
+        norm_path = normalize_canonical_path(url)
+        event_id = f"evt_{uuid.uuid4().hex}"
+        payload: Dict[str, Any] = {
+            "eventId": event_id,
+            "orderId": order_id,
+            "kioskId": DEVICE_ID,
+            "printer": self._canonical_printer(printer),
+            "isFallback": is_fallback,
+        }
+        if doc_id:
+            payload["docId"] = doc_id
+        if pages_attempted is not None:
+            payload["pagesAttempted"] = pages_attempted
+        if supersede_attempt_id:
+            payload["supersedeAttemptId"] = supersede_attempt_id
+        if reason:
+            payload["reason"] = reason
+
+        body = json.dumps(payload).encode("utf-8")
+        headers = get_auth_headers(body, method="POST", path=norm_path)
+        try:
+            res = requests.post(url, data=body, headers=headers, timeout=8)
+            if 200 <= res.status_code < 300:
+                data = res.json() if res.content else {}
+                if isinstance(data, dict) and data.get("attemptId"):
+                    return data
+        except Exception as exc:
+            logger.warning("Failed creating backend attempt for %s: %s", order_id, exc)
+        return None
+
+    def _bind_attempt(self, order_id: str, attempt_id: str, printer: str, cups_job_id: str) -> bool:
+        """Persist 1-to-1 (attemptId, cupsJobId) ownership before sending progress or completion."""
+        payload = {
+            "orderId": order_id,
+            "attemptId": attempt_id,
+            "printer": self._canonical_printer(printer),
+            "cupsJobId": cups_job_id,
+        }
+        return self._cloud_request(f"/api/device/jobs/{order_id}?action=bind", payload, method="POST")
+
+    def _report_processing(self, order_id: str) -> bool:
+        payload = {"orderId": order_id}
+        return self._cloud_request(f"/api/device/jobs/{order_id}?action=processing", payload, method="POST")
+
+    def _report_progress(
+        self,
+        order_id: str,
+        pages_printed: int,
+        cups_job_id: Optional[str] = None,
+        status: Optional[str] = None,
+        attempt_id: Optional[str] = None,
+        printer: Optional[str] = None,
+    ) -> bool:
         payload: Dict[str, Any] = {"pagesPrinted": pages_printed, "orderId": order_id}
+        if attempt_id:
+            payload["attemptId"] = attempt_id
+        if printer:
+            payload["printer"] = self._canonical_printer(printer)
         if cups_job_id:
             payload["cupsJobId"] = cups_job_id
         if status:
             payload["status"] = status
         return self._cloud_request(f"/api/device/jobs/{order_id}", payload, method="PATCH")
 
-    def _report_complete(self, order_id: str, pages_printed: int, cups_job_id: Optional[str]) -> bool:
-        payload = {"orderId": order_id, "pagesPrinted": pages_printed, "cupsJobId": cups_job_id}
+    def _report_complete(
+        self,
+        order_id: str,
+        pages_printed: int,
+        cups_job_id: Optional[str],
+        attempt_id: Optional[str] = None,
+        printer: Optional[str] = None,
+    ) -> bool:
+        payload: Dict[str, Any] = {
+            "orderId": order_id,
+            "pagesPrinted": pages_printed,
+            "cupsJobId": cups_job_id,
+        }
+        if attempt_id:
+            payload["attemptId"] = attempt_id
+        if printer:
+            payload["printer"] = self._canonical_printer(printer)
         return self._cloud_request(f"/api/device/jobs/{order_id}?action=complete", payload)
 
-    def _report_failure(self, order_id: str, pages_printed: int, reason: str) -> bool:
-        payload = {"orderId": order_id, "pagesPrinted": pages_printed, "reason": reason[:500]}
+    def _report_failure(
+        self,
+        order_id: str,
+        pages_printed: int,
+        reason: str,
+        attempt_id: Optional[str] = None,
+        manual_review: bool = False,
+    ) -> bool:
+        payload: Dict[str, Any] = {
+            "orderId": order_id,
+            "pagesPrinted": pages_printed,
+            "reason": reason[:500],
+            "manualReview": manual_review,
+        }
+        if attempt_id:
+            payload["attemptId"] = attempt_id
         return self._cloud_request(f"/api/device/jobs/{order_id}?action=fail", payload)
 
     # ------------------------------------------------------------------
