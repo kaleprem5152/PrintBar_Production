@@ -4,11 +4,8 @@ Includes shared test vectors verified against TypeScript backend authenticator.
 """
 import sys
 import os
-import json
-import time
 import hmac
 import hashlib
-import pytest
 import importlib
 
 AGENT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -67,6 +64,7 @@ def test_token_matches_canonical_hmac(dev_env):
     canonical_msg = auth.build_canonical_message("POST", "/api/device/jobs", ts, nonce, body_sha256).encode("utf-8")
     expected = hmac.new(secret, canonical_msg, hashlib.sha256).hexdigest()
 
+    assert device_id == os.environ["DEVICE_ID"]
     assert sig == expected
 
 
